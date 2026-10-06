@@ -10,7 +10,7 @@ on:
         type: string
         required: true
       ref:
-        description: Commit or branch to build (default: the triggering ref)
+        description: 'Commit or branch to build (default: the triggering ref)'
         type: string
         default: ''
 
