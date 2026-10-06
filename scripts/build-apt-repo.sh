@@ -11,7 +11,7 @@
 # Output (uploaded to R2 by publish.yml):
 #   dists/sid/{InRelease,Release,Release.gpg}
 #   dists/sid/main/binary-amd64/Packages{,.gz,.xz}
-#   dists/sid/main/binary-amd64/by-hash/SHA256/<sum>   (Acquire-By-Hash)
+#   dists/sid/main/binary-amd64/by-hash/SHA{256,512}/<sum>   (Acquire-By-Hash)
 #   flatpark-archive-keyring.{gpg,asc}, flatpark.sources, index.html
 #   flatpark-archive-keyring.deb   (when collected)
 #
@@ -34,15 +34,17 @@ stanzas=("$IN"/stanzas/*.packages)
 
 rm -rf "$OUT"
 bin="dists/$SUITE/$COMP/binary-$ARCH"
-mkdir -p "$OUT/$bin/by-hash/SHA256"
+mkdir -p "$OUT/$bin/by-hash/SHA256" "$OUT/$bin/by-hash/SHA512"
 cd "$OUT"
 
 # Each stanza already ends with a blank line.
 cat "${stanzas[@]}" > "$bin/Packages"
 gzip -9nk "$bin/Packages"
 xz -9k "$bin/Packages"
+# apt fetches by-hash under the strongest hash the Release lists (SHA512).
 for f in "$bin"/Packages "$bin"/Packages.gz "$bin"/Packages.xz; do
     cp "$f" "$bin/by-hash/SHA256/$(sha256sum "$f" | cut -d' ' -f1)"
+    cp "$f" "$bin/by-hash/SHA512/$(sha512sum "$f" | cut -d' ' -f1)"
 done
 
 apt-ftparchive \
