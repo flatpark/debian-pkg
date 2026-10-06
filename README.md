@@ -1,208 +1,102 @@
-# scx scheds for debian sid
+# FlatPark debian-pkg
 
-Debian packages for [sched_ext](https://github.com/sched-ext/scx) CPU
-schedulers, built from upstream release tags inside a container and published
-through GitHub Releases.
+Debian packages picked by [FlatPark](https://flatpark.org), published as the
+apt repository **https://apt.flatpark.org**.
 
-Two binary packages are produced:
+Unlike FlatPark's Flatpaks, these are **native packages**: they install on
+the host and are **not sandboxed**. There is no upstream-approval process;
+the selection is simply software worth having on a Debian sid desktop.
 
-| Package | Contents |
-|---|---|
-| `scx` | The schedulers themselves (`scx_lavd`, `scx_bpfland`, `scx_rusty`, ...) plus a simple `scx.service` driven by `/etc/default/scx` |
-| `scx-loader` | The `scx_loader` D-Bus daemon with its `scxctl` CLI and `scxtui` TUI, configured via `/etc/scx_loader.toml` |
+**Supported platform: Debian sid (unstable), amd64.** Packages are built
+against current sid and are not expected to work on stable.
 
-Both systemd units ship **disabled** — nothing starts or switches your CPU
-scheduler until you opt in.
-
-**Supported platform: Debian sid (unstable) only.** Binaries are linked
-against the current sid glibc and are not expected to work on stable or older
-distributions. You also need a kernel with sched_ext support (>= 6.12, built
-with `CONFIG_SCHED_CLASS_EXT`; e.g. XanMod).
-
-## Installing
-
-From the apt repository at <https://apt.guojing.io> (recommended — you get
-upgrades through `apt upgrade`):
+## Install
 
 ```sh
-sudo curl -fsSLo /usr/share/keyrings/guojing-archive-keyring.gpg \
-    https://apt.guojing.io/guojing-archive-keyring.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/guojing.sources \
-    https://apt.guojing.io/guojing.sources
+curl -fsSLO https://apt.flatpark.org/flatpark-archive-keyring.deb
+sudo apt install ./flatpark-archive-keyring.deb
 sudo apt update
-sudo apt install scx
-# optional, for scxctl/scxtui:
-sudo apt install scx-loader
 ```
 
-Or download the `.deb` files from the [releases page](../../releases)
-(release `scx-v<version>` contains everything) and install them directly:
+The keyring package installs the signing key and the apt source, and keeps
+both current through later upgrades.
 
-```sh
-sudo apt install ./scx_<version>-1_amd64.deb ./scx-loader_<version>-1_amd64.deb
-```
+## Packages
 
-Runtime dependencies are minimal (libc, libelf, libseccomp, zlib — libbpf is
-linked statically).
+| Package | What | Built from |
+| --- | --- | --- |
+| [scx](packages/scx/) | sched_ext CPU schedulers + `scx.service` | source (release tag) |
+| [scx-loader](packages/scx-loader/) | `scx_loader` daemon, `scxctl`, `scxtui` | source (release tag) |
+| [strata](packages/strata/) | Strata, keyboard-first GTK 4 file manager | upstream release binary, repackaged |
+| [flatpark-archive-keyring](packages/flatpark-archive-keyring/) | the repository's key and apt source | this repo |
 
-## Configuring
+Each package directory has its own README with usage and packaging notes.
 
-Pick **one** of the two mechanisms below; they both work, just don't run them
-at the same time.
-
-### Option A: `scx.service` (simple, no daemon)
-
-Edit `/etc/default/scx`:
-
-```sh
-SCX_SCHEDULER=scx_lavd
-# SCX_FLAGS="--autopilot"        # extra flags passed to the scheduler
-```
-
-Any scheduler installed under `/usr/sbin/scx_*` can be used. Check
-`scx_lavd --help` for available flags.
-
-### Option B: `scx_loader` (D-Bus daemon + `scxctl`)
-
-Edit `/etc/scx_loader.toml`:
-
-```toml
-default_sched = "scx_lavd"
-default_mode  = "Auto"     # Auto | Gaming | LowLatency | PowerSave | Server
-
-# per-scheduler flags per mode:
-# [scheds.scx_lavd]
-# gaming_mode = ["--performance"]
-```
-
-`scxctl list` shows the schedulers the loader knows about. Note that a few
-in-tree schedulers (`scx_layered`, `scx_mitosis`) are not wired into the
-loader and are only available through option A.
-
-## Starting
-
-```sh
-# Option A:
-sudo systemctl enable --now scx
-
-# Option B:
-sudo systemctl enable --now scx_loader
-scxctl get          # current scheduler + mode
-scxctl list         # schedulers supported by the loader
-scxctl switch scx_bpfland
-scxctl stop
-scxtui              # interactive TUI (scheduler list, status, logs)
-```
-
-For a quick test without any service, just run a scheduler in the foreground;
-`Ctrl-C` returns you to the kernel's default scheduler:
-
-```sh
-sudo scx_lavd --monitor 5
-```
-
-Useful status checks:
-
-```sh
-cat /sys/kernel/sched_ext/state   # enabled / disabled + loaded ops
-systemctl status scx              # or scx_loader
-journalctl -u scx_loader -b       # loader/scheduler logs
-```
-
-## Building locally
-
-Requires `podman` or `docker`; nothing is installed on the host.
-
-```sh
-./build.sh                              # versions pinned in the changelogs
-SCX_VERSION=1.1.4 ./build.sh            # track a specific scx release
-SCX_VERSION=latest LOADER_VERSION=latest ./build.sh
-```
-
-Artifacts land in `out/` — one `.deb` per source package. The container
-fetches upstream sources at build time, vendors all Rust crates for offline
-builds, and runs `dpkg-buildpackage` with
-`DEB_BUILD_OPTIONS="nocheck noautodbgsym parallel=$(nproc)"`, i.e. tests
-skipped and no `-dbgsym` packages. Set `DEB_BUILD_OPTIONS` yourself to
-change that (dropping `noautodbgsym` brings the debug symbol packages back).
-
-## CI / releases
-
-`.github/workflows/check-upstream.yml` — weekly (Mon 18:30 UTC) and on
-demand: compares the newest release tag of both upstream repos against the
-versions pinned in `packaging/*/changelog` and opens an issue when one is
-behind (nothing else; no build, no issue if everything is current, and no
-duplicate if the issue is already open).
-
-`.github/workflows/build-deb.yml` — builds the debs, never on a schedule:
-
-- **tag push** `v*` — builds that scx version and publishes a GitHub Release
-  (`scx-v<version>`);
-- **workflow_dispatch** — manual run with version inputs; set the `release`
-  checkbox to publish, otherwise the debs are only kept as run artifacts.
-
-Whenever `build-deb` publishes a release it also calls
-`.github/workflows/publish-apt.yml`, which can be run on its own too. It
-downloads the debs from the 3 most recent releases, builds a signed apt
-repository with `scripts/build-apt-repo.sh` and force-pushes it as a
-single commit to the `gh-pages` branch, which GitHub Pages serves at
-`apt.guojing.io`.
-
-### Maintaining the apt repository
-
-One-time setup:
-
-1. Create a passphrase-less signing key and store it as a secret:
-
-   ```sh
-   export GNUPGHOME=$(mktemp -d)
-   gpg --batch --passphrase '' --quick-gen-key \
-       'apt.guojing.io archive key' ed25519 sign never
-   gpg --armor --export-secret-keys | gh secret set APT_SIGNING_KEY
-   gpg --armor --export-secret-keys > apt-signing-key.asc  # keep offline
-   ```
-
-   The public half is re-exported on every run, so rotating the key only
-   means replacing the secret (users then re-download the keyring).
-2. DNS: `apt.guojing.io  CNAME  jing2uo.github.io.`
-3. Run `publish-apt` once to create `gh-pages`, then enable Pages from that
-   branch with the custom domain and HTTPS:
-
-   ```sh
-   gh api -X POST repos/{owner}/{repo}/pages -f 'source[branch]=gh-pages' -f 'source[path]=/'
-   gh api -X PUT  repos/{owner}/{repo}/pages -f cname=apt.guojing.io -F https_enforced=true
-   ```
-
-   (`https_enforced` only succeeds once GitHub has issued the certificate,
-   which can take a few minutes after DNS resolves.)
-
-## Repository layout
+## How it works
 
 ```
-packaging/scx/        debian/ packaging for the schedulers (source: sched-ext/scx)
-packaging/scx-loader/ debian/ packaging for the loader (source: sched-ext/scx-loader)
-scripts/prepare-source.sh   clone tag -> cargo vendor -> orig tarball -> overlay packaging/
-scripts/build-apt-repo.sh   debs -> signed apt repo tree (dists/, pool/, keyring)
-Containerfile        debian:sid build environment (shared by local builds and CI)
-build.sh             local build wrapper (podman or docker)
+packages/<source>/
+  debian/             standard Debian packaging; debian/changelog is the
+                      single source of truth for the version
+  fetch.sh            version -> ready-to-build source tree
+  resolve-update.sh   newest upstream release (FlatPark's resolver JSON)
+  meta.json           upstream pin (url + sha256) and "automerge" policy
+  smoke.sh            optional post-install check
+  README.md
 ```
 
-## Notes
+- **Build.** `./build.sh <source>` runs everything in a throwaway
+  `debian:sid` container (podman or docker): install Build-Depends, `fetch.sh`,
+  `dpkg-buildpackage -b`, install the result (proves `Depends` resolve on
+  sid), run `smoke.sh`. Source builds and binary repacks take the same path.
+- **Release.** On every push to `main`, each package whose changelog version
+  has no GitHub Release yet is built and released as `<source>_<version>`,
+  carrying its `.deb`s and a `<tag>.packages` index stanza. Releases are never
+  overwritten. To rebuild an unchanged package (a sid library transition, for
+  example), add a changelog entry with the next Debian revision.
+- **Publish.** `publish.yml` stitches the stanzas of the newest two versions
+  of each package into a signed index (`Acquire-By-Hash`) and uploads only that
+  metadata to R2. The Cloudflare Worker in `worker/` serves it at
+  apt.flatpark.org and redirects `pool/<tag>/<file>.deb` to the GitHub Release
+  asset. apt verifies every `.deb` against the signed hashes, so the redirect
+  costs no trust, and package bytes never touch R2.
+- **Updates.** `update-check.yml` runs each resolver daily. A newer upstream
+  version gets a changelog entry and a re-pin, is built and tested, and lands
+  as a PR from `auto/update-<source>`. Packages with `"automerge": true` are
+  merged and released right away; the rest wait for review.
+- **CI.** Pull requests build every package they touch (all packages when
+  `build.sh` or `scripts/` change).
 
-- Packaging is derived from
-  [sched-ext/scx-scheds-packaging-deb](https://github.com/sched-ext/scx-scheds-packaging-deb),
-  adapted for the Debian toolchain: sid's `rustc`/`cargo` instead of
-  Ubuntu's `rust-1.91`, `bpftool` instead of `linux-tools-*`, `--jobs nproc`,
-  and a per-tag generated install manifest (version bumps require no
-  packaging edits).
-- `scx_loader`, `scxctl` and `scxtui` used to live in the main scx tree and
-  were moved to their own repository; they are packaged here from
-  [sched-ext/scx-loader](https://github.com/sched-ext/scx-loader).
+## Adding a package
 
-## References
+1. Create `packages/<source>/` with `debian/`, `fetch.sh` and a README.
+   - Repacking an upstream binary: copy `packages/strata/`, pin the artifact
+     in `meta.json`, use `fetch_pinned`.
+   - Building a Rust project from a tag: copy `packages/scx-loader/`, which
+     uses `scripts/cargo/fetch-tag.sh`.
+2. Add `resolve-update.sh` so the update check tracks it, and `smoke.sh` if a
+   quick check fits.
+3. `./build.sh <source>` locally, open a PR, merge. The release follows.
 
-- [sched-ext/scx](https://github.com/sched-ext/scx) — schedulers and tools
-- [sched-ext/scx-loader](https://github.com/sched-ext/scx-loader) — loader daemon, scxctl, scxtui
-- [sched-ext/scx-scheds-packaging-deb](https://github.com/sched-ext/scx-scheds-packaging-deb) — upstream Debian/Ubuntu packaging this repo started from
-- [sched_ext wiki](https://github.com/sched-ext/scx/wiki)
-- [CachyOS sched_ext guide](https://wiki.cachyos.org/configuration/sched-ext/)
+## Maintaining the repository
+
+One-time setup, already done for the live repository:
+
+1. **Signing key.** `scripts/gen-signing-key.sh <backup-file>` creates a
+   certify-only master and a signing subkey, stores the subkey as the
+   `APT_SIGNING_SUBKEY` secret and the master fingerprint as the
+   `APT_SIGNING_FPR` variable, and writes the public key into the keyring
+   package. Keep the master backup offline.
+2. **R2.** Bucket `flatpark-apt`; secrets `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+   `R2_SECRET_ACCESS_KEY` (object read/write on that bucket).
+3. **Worker.** Secrets `CLOUDFLARE_API_TOKEN` (Workers edit, R2 read, zone
+   flatpark.org routes) and `CLOUDFLARE_ACCOUNT_ID`; `deploy-worker.yml`
+   deploys `worker/` and binds `apt.flatpark.org` as a custom domain.
+
+## History
+
+This repository began as `jing2uo/scx-scheds-debian-sid`, which published scx
+at `apt.guojing.io`. It moved to the FlatPark organization in October 2026
+and became a general package repository. Users of the old source should
+install `flatpark-archive-keyring` and remove
+`/etc/apt/sources.list.d/guojing.sources`.

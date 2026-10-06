@@ -1,3 +1,9 @@
+scx-loader (1.1.3-2) unstable; urgency=medium
+
+  * Move packaging to flatpark/debian-pkg; published at apt.flatpark.org.
+
+ -- Komh <mail@guojing.io>  Tue, 06 Oct 2026 13:40:40 +0800
+
 scx-loader (1.1.3-1) unstable; urgency=medium
 
   * Package upstream scx-loader v1.1.3: scx_loader daemon, scxctl and

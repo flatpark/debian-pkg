@@ -1,0 +1,36 @@
+name: ci
+
+# Pull requests: build every package the PR touches (all of them when the
+# shared build scripts change).
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.s.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: s
+        run: |
+          s="$(scripts/select-sources.sh changed '${{ github.event.pull_request.base.sha }}' '${{ github.event.pull_request.head.sha }}')"
+          echo "sources=$s" >> "$GITHUB_OUTPUT"
+          echo "packages: $s"
+
+  build:
+    needs: select
+    if: needs.select.outputs.sources != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.select.outputs.sources) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      source: ${{ matrix.source }}

@@ -1,0 +1,79 @@
+name: publish
+
+# Rebuild and sign the apt index for https://apt.flatpark.org from the GitHub
+# Releases (newest 2 versions per package) and upload it to R2. Stateless and
+# safe to re-run. The .debs are not uploaded: the Worker redirects pool/ to
+# the release assets.
+#
+# Needs: secret APT_SIGNING_SUBKEY + variable APT_SIGNING_FPR
+#        (scripts/gen-signing-key.sh), secrets R2_ACCOUNT_ID,
+#        R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  R2_BUCKET: flatpark-apt
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        env:
+          HAVE_KEY: ${{ secrets.APT_SIGNING_SUBKEY != '' && vars.APT_SIGNING_FPR != '' }}
+          HAVE_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' }}
+        run: |
+          [ "$HAVE_KEY" = true ] || { echo "::error::APT_SIGNING_SUBKEY / APT_SIGNING_FPR not set (scripts/gen-signing-key.sh)"; exit 1; }
+          [ "$HAVE_R2" = true ]  || { echo "::error::R2 credentials not set"; exit 1; }
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils rclone
+
+      - name: Import signing subkey
+        env:
+          APT_SIGNING_SUBKEY: ${{ secrets.APT_SIGNING_SUBKEY }}
+        run: |
+          printf '%s\n' "$APT_SIGNING_SUBKEY" | gpg --batch --import
+          echo "GPG_KEY_ID=${{ vars.APT_SIGNING_FPR }}" >> "$GITHUB_ENV"
+
+      - name: Collect index stanzas
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/collect-index.sh collected
+
+      - name: Build index
+        run: scripts/build-apt-repo.sh collected public
+
+      # Order matters for clients mid-update: by-hash files first (never
+      # deleted here, so an older InRelease still resolves), then the plain
+      # files, the signed Release files last.
+      - name: Upload to R2
+        run: |
+          set -eu
+          r2="r2:$R2_BUCKET"
+          rclone copy public "$r2" --include '/dists/**/by-hash/**' --checksum
+          rclone copy public "$r2" --exclude '/dists/**/by-hash/**' \
+            --exclude '/dists/*/InRelease' --exclude '/dists/*/Release' --exclude '/dists/*/Release.gpg' --checksum
+          rclone copy public "$r2" --include '/dists/*/Release' --include '/dists/*/Release.gpg' --include '/dists/*/InRelease' --checksum
+          # Old by-hash entries only matter for a client caught mid-update.
+          rclone delete "$r2/dists" --include '**/by-hash/**' --min-age 7d

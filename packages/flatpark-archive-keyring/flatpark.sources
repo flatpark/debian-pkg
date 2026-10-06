@@ -1,0 +1,6 @@
+Types: deb
+URIs: https://apt.flatpark.org
+Suites: sid
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/flatpark-archive-keyring.gpg

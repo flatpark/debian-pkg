@@ -1,0 +1,89 @@
+name: release
+
+# Every package whose debian/changelog version has no GitHub Release yet is
+# built and released as <source>_<version> (its .debs + <tag>.packages), then
+# the apt index is republished. Idempotent: an existing release is never
+# rebuilt or overwritten, because the published index pins its hashes. To
+# rebuild a package unchanged (say, after a sid library transition), add a
+# changelog entry with the next Debian revision.
+#
+# Runs on pushes to main, and is dispatched by update-check.yml after an
+# automatic merge (pushes made with GITHUB_TOKEN trigger no workflows).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+      - 'scripts/**'
+      - 'build.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.s.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          s="$(scripts/select-sources.sh unreleased)"
+          echo "sources=$s" >> "$GITHUB_OUTPUT"
+          echo "unreleased: $s"
+
+  build:
+    needs: select
+    if: needs.select.outputs.sources != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.select.outputs.sources) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      source: ${{ matrix.source }}
+      ref: ${{ github.sha }}
+
+  release:
+    needs: [select, build]
+    # Release whatever built; a failed package must not hold back the others.
+    if: always() && needs.select.outputs.sources != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: artifacts
+      - name: Create releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . scripts/lib.sh
+          shopt -s nullglob
+          for dir in artifacts/deb-*; do
+            src="${dir#artifacts/deb-}"
+            tag="$(release_tag "$src")"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$tag already released"; continue
+            fi
+            # Release notes: the top changelog entry.
+            notes="$(awk 'NR > 2 && /^ -- / {exit} NR > 2' "packages/$src/debian/changelog")"
+            gh release create "$tag" "$dir"/* --target "$GITHUB_SHA" \
+              --title "$src $(deb_version "$src")" --notes "$notes"
+          done
+
+  publish:
+    needs: release
+    if: always() && needs.release.result == 'success'
+    uses: ./.github/workflows/publish.yml
+    secrets: inherit

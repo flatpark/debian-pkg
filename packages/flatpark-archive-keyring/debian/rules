@@ -1,0 +1,6 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+execute_before_dh_install:
+	gpg --dearmor < flatpark-archive-keyring.asc > flatpark-archive-keyring.gpg

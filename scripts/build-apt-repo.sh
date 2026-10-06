@@ -1,58 +1,59 @@
 #!/usr/bin/env bash
-# Assemble a signed, flat-pool apt repository from a directory of .debs.
+# Assemble the signed apt index for https://apt.flatpark.org.
 #
-#   GPG_KEY_ID=<fingerprint> scripts/build-apt-repo.sh <debs-dir> <out-dir>
+#   GPG_KEY_ID=<master fingerprint> scripts/build-apt-repo.sh <collected-dir> <out-dir>
 #
-# Layout produced (served as-is at https://apt.guojing.io):
+# <collected-dir> is what collect-index.sh produced. Only metadata is built
+# here; the .debs stay in GitHub Releases and the Worker redirects
+# pool/<tag>/<file> to them (worker/src/index.js). Every .deb's size and
+# hashes are in the signed index, so apt verifies whatever the redirect serves.
 #
-#   <out>/dists/sid/{Release,InRelease,Release.gpg}
-#   <out>/dists/sid/main/binary-amd64/Packages{,.gz,.xz}
-#   <out>/pool/main/<pkg>/<file>.deb
-#   <out>/guojing-archive-keyring.{gpg,asc}   public signing key
-#   <out>/guojing.sources                     deb822 source for apt
+# Output (uploaded to R2 by publish.yml):
+#   dists/sid/{InRelease,Release,Release.gpg}
+#   dists/sid/main/binary-amd64/Packages{,.gz,.xz}
+#   dists/sid/main/binary-amd64/by-hash/SHA256/<sum>   (Acquire-By-Hash)
+#   flatpark-archive-keyring.{gpg,asc}, flatpark.sources, index.html
+#   flatpark-archive-keyring.deb   (when collected)
 #
-# Needs apt-ftparchive (apt-utils), gpg, gzip, xz. The signing key must
-# already be in the gpg keyring and have no passphrase.
+# GPG_KEY_ID is the certify-only master; gpg signs with its signing subkey,
+# which is the only secret CI holds.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 
-DEBS="${1:?usage: $0 <debs-dir> <out-dir>}"
-OUT="${2:?usage: $0 <debs-dir> <out-dir>}"
-: "${GPG_KEY_ID:?set GPG_KEY_ID to the signing key fingerprint}"
+IN="$(cd "${1:?usage: $0 <collected-dir> <out-dir>}" && pwd)"
+OUT="${2:?usage: $0 <collected-dir> <out-dir>}"
+: "${GPG_KEY_ID:?set GPG_KEY_ID to the master fingerprint of the signing key}"
 
-DOMAIN="${APT_DOMAIN:-apt.guojing.io}"
-SUITE=sid
-COMP=main
-ARCH=amd64
-KEYRING=guojing-archive-keyring
+DOMAIN=apt.flatpark.org
+SUITE=sid COMP=main ARCH=amd64
+KEYRING=flatpark-archive-keyring
 
 shopt -s nullglob
-debs=("$DEBS"/*.deb)
-[ ${#debs[@]} -gt 0 ] || { echo "ERROR: no .deb in $DEBS" >&2; exit 1; }
+stanzas=("$IN"/stanzas/*.packages)
+[ ${#stanzas[@]} -gt 0 ] || die "no stanzas in $IN/stanzas"
 
 rm -rf "$OUT"
-mkdir -p "$OUT/dists/$SUITE/$COMP/binary-$ARCH"
-
-for deb in "${debs[@]}"; do
-    pkg="$(dpkg-deb -f "$deb" Package)"
-    mkdir -p "$OUT/pool/$COMP/$pkg"
-    cp "$deb" "$OUT/pool/$COMP/$pkg/"
-done
-
+bin="dists/$SUITE/$COMP/binary-$ARCH"
+mkdir -p "$OUT/$bin/by-hash/SHA256"
 cd "$OUT"
 
-bin="dists/$SUITE/$COMP/binary-$ARCH"
-apt-ftparchive packages "pool/$COMP" > "$bin/Packages"
+# Each stanza already ends with a blank line.
+cat "${stanzas[@]}" > "$bin/Packages"
 gzip -9nk "$bin/Packages"
 xz -9k "$bin/Packages"
+for f in "$bin"/Packages "$bin"/Packages.gz "$bin"/Packages.xz; do
+    cp "$f" "$bin/by-hash/SHA256/$(sha256sum "$f" | cut -d' ' -f1)"
+done
 
 apt-ftparchive \
-    -o APT::FTPArchive::Release::Origin="$DOMAIN" \
-    -o APT::FTPArchive::Release::Label="$DOMAIN" \
+    -o APT::FTPArchive::Release::Origin=FlatPark \
+    -o APT::FTPArchive::Release::Label=FlatPark \
     -o APT::FTPArchive::Release::Suite=unstable \
     -o APT::FTPArchive::Release::Codename="$SUITE" \
     -o APT::FTPArchive::Release::Architectures="$ARCH" \
     -o APT::FTPArchive::Release::Components="$COMP" \
-    -o APT::FTPArchive::Release::Description="Personal packages for Debian sid" \
+    -o APT::FTPArchive::Release::Acquire-By-Hash=yes \
+    -o APT::FTPArchive::Release::Description="FlatPark native packages for Debian sid (not sandboxed)" \
     release "dists/$SUITE" > "dists/$SUITE/Release.tmp"
 mv "dists/$SUITE/Release.tmp" "dists/$SUITE/Release"
 
@@ -63,8 +64,9 @@ gpg --batch --yes --local-user "$GPG_KEY_ID" --digest-algo SHA512 \
 
 gpg --batch --export "$GPG_KEY_ID" > "$KEYRING.gpg"
 gpg --batch --armor --export "$GPG_KEY_ID" > "$KEYRING.asc"
+if [ -f "$IN/$KEYRING.deb" ]; then cp "$IN/$KEYRING.deb" "$KEYRING.deb"; fi
 
-cat > guojing.sources <<EOF
+cat > flatpark.sources <<EOF
 Types: deb
 URIs: https://$DOMAIN
 Suites: $SUITE
@@ -73,26 +75,23 @@ Architectures: $ARCH
 Signed-By: /usr/share/keyrings/$KEYRING.gpg
 EOF
 
-# GitHub Pages bits: custom domain, and don't run Jekyll over the tree.
-echo "$DOMAIN" > CNAME
-touch .nojekyll
-
+packages="$(awk -F': ' '/^Package:/{p=$2} /^Version:/{print p, $2}' "$bin/Packages" | sort -V)"
 cat > index.html <<EOF
 <!doctype html>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>$DOMAIN</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem}pre{background:#8881;padding:.8rem;overflow-x:auto}</style>
 <h1>$DOMAIN</h1>
-<p>apt repository for Debian sid (amd64).
-Source: <a href="https://github.com/jing2uo/scx-scheds-debian-sid">jing2uo/scx-scheds-debian-sid</a>.</p>
-<pre>sudo curl -fsSLo /usr/share/keyrings/$KEYRING.gpg https://$DOMAIN/$KEYRING.gpg
-sudo curl -fsSLo /etc/apt/sources.list.d/guojing.sources https://$DOMAIN/guojing.sources
-sudo apt update
-sudo apt install scx scx-loader</pre>
+<p>FlatPark's apt repository for Debian sid (amd64): native packages, installed
+on the host and <strong>not sandboxed</strong>. Packaging:
+<a href="https://github.com/flatpark/debian-pkg">flatpark/debian-pkg</a>.</p>
+<pre>curl -fsSLO https://$DOMAIN/$KEYRING.deb
+sudo apt install ./$KEYRING.deb
+sudo apt update</pre>
 <h2>Packages</h2>
-<pre>$(apt-ftparchive packages "pool/$COMP" 2>/dev/null \
-    | awk -F': ' '/^Package:/{p=$2} /^Version:/{print p, $2}' | sort -V)</pre>
+<pre>$packages</pre>
 EOF
 
-echo ">> repo ready in $OUT"
-find . -type f -not -path './pool/*' | sort
+log "repo ready in $OUT"
+find . -type f | sort >&2

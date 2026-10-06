@@ -1,0 +1,31 @@
+name: build
+
+# Builds one package in a debian:sid container (./build.sh): fetch, build,
+# install test, smoke test. Called by ci.yml and release.yml.
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        type: string
+        required: true
+      ref:
+        description: Commit or branch to build (default: the triggering ref)
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Build ${{ inputs.source }}
+        run: ./build.sh '${{ inputs.source }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ inputs.source }}
+          path: out/${{ inputs.source }}/
+          if-no-files-found: error

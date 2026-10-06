@@ -1,0 +1,16 @@
+// apt.flatpark.org: the apt repository front.
+// Deploy: wrangler deploy (from this directory), or the deploy-worker workflow.
+//
+// dists/, the keyring files and index.html live in the R2 bucket (written by
+// publish.yml). pool/<tag>/<file>.deb is never stored: it redirects to the
+// GitHub Release asset of the same name, and apt checks it against the
+// signed index.
+{
+  "name": "flatpark-apt",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  "routes": [{ "pattern": "apt.flatpark.org", "custom_domain": true }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "flatpark-apt" }],
+  "vars": { "GITHUB_REPO": "flatpark/debian-pkg" }
+}

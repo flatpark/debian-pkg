@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+# Repack of the upstream release binary. It is installed byte-identical to the
+# published artifact (no strip, no dwz) so `gh attestation verify` still
+# matches /usr/bin/strata.
+
+%:
+	dh $@
+
+override_dh_strip override_dh_dwz:

@@ -1,0 +1,16 @@
+Source: flatpark-archive-keyring
+Section: misc
+Priority: optional
+Maintainer: Komh <mail@guojing.io>
+Standards-Version: 4.7.3
+Build-Depends: debhelper-compat (= 13), gpg
+Rules-Requires-Root: no
+Homepage: https://github.com/flatpark/debian-pkg
+
+Package: flatpark-archive-keyring
+Architecture: all
+Depends: ${misc:Depends}
+Description: apt.flatpark.org archive key and apt source
+ Installs the OpenPGP key that signs https://apt.flatpark.org and the
+ deb822 source pointing apt at it. Key rotations reach users through
+ upgrades of this package.

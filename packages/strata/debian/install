@@ -1,0 +1,7 @@
+strata usr/bin/
+io.github.lgse.Strata.desktop usr/share/applications/
+io.github.lgse.Strata.svg usr/share/icons/hicolor/scalable/apps/
+# Inactive template only, per upstream docs/packaging.md: installing Strata
+# must not make it the org.freedesktop.FileManager1 owner. Users opt in by
+# copying it to ~/.local/share/dbus-1/services/.
+io.github.lgse.Strata.FileManager1.service usr/share/strata/

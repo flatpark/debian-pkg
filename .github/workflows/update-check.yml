@@ -1,0 +1,90 @@
+name: update-check
+
+# Daily: for each package with a resolver, bump to the newest upstream
+# release, build it, and open (or refresh) a PR from auto/update-<source>.
+# Packages with "automerge": true in meta.json are merged once the build
+# passes, and release.yml is dispatched; the rest wait for review.
+
+on:
+  schedule:
+    - cron: '23 5 * * *'   # 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.s.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: s
+        run: echo "sources=$(scripts/select-sources.sh updatable)" >> "$GITHUB_OUTPUT"
+
+  update:
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.select.outputs.sources) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SRC: ${{ matrix.source }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve
+        id: bump
+        run: |
+          v="$(scripts/check-update.sh "$SRC")"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already proposed
+        id: open
+        if: steps.bump.outputs.version != ''
+        run: |
+          title="$SRC: update to ${{ steps.bump.outputs.version }}"
+          if gh pr list --state open --head "auto/update-$SRC" --json title -q '.[].title' | grep -Fxq "$title"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: steps.bump.outputs.version != '' && steps.open.outputs.skip != 'true'
+        run: ./build.sh "$SRC"
+
+      - name: Open PR
+        if: steps.bump.outputs.version != '' && steps.open.outputs.skip != 'true'
+        env:
+          TITLE: ${{ steps.open.outputs.title }}
+        run: |
+          set -eu
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "auto/update-$SRC"
+          git add "packages/$SRC"
+          git commit -qm "$TITLE"
+          git push -f origin "auto/update-$SRC"
+          body="Opened by update-check. The package was built, install-tested and smoke-tested in [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          n="$(gh pr list --state open --head "auto/update-$SRC" --json number -q '.[0].number')"
+          if [ -n "$n" ]; then
+            gh pr edit "$n" --title "$TITLE" --body "$body"
+          else
+            gh pr create --head "auto/update-$SRC" --title "$TITLE" --body "$body"
+          fi
+
+      - name: Merge
+        if: steps.bump.outputs.version != '' && steps.open.outputs.skip != 'true'
+        run: |
+          if [ "$(jq -r '.automerge // false' "packages/$SRC/meta.json" 2>/dev/null)" = true ]; then
+            gh pr merge "auto/update-$SRC" --squash --delete-branch
+            gh workflow run release.yml --ref main
+          else
+            echo "$SRC: no automerge, left for review"
+          fi

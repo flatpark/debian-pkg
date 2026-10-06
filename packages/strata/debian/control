@@ -1,0 +1,52 @@
+Source: strata
+Section: utils
+Priority: optional
+Maintainer: Komh <mail@guojing.io>
+Standards-Version: 4.7.3
+# Repack of the upstream binary: nothing is compiled. The runtime libraries are
+# here only so dh_shlibdeps can compute Depends from the binary's DT_NEEDED.
+Build-Depends: debhelper-compat (= 13),
+ libcairo2,
+ libfontconfig1,
+ libgdk-pixbuf-2.0-0,
+ libglib2.0-0t64,
+ libgraphene-1.0-0,
+ libgstreamer-plugins-base1.0-0,
+ libgstreamer1.0-0,
+ libgtk-4-1,
+ libgtksourceview-5-0,
+ libpango-1.0-0,
+ libpangocairo-1.0-0,
+ libpoppler-glib8t64,
+ libstdc++6,
+Rules-Requires-Root: no
+Homepage: https://github.com/lgse/strata
+
+Package: strata
+Architecture: amd64
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+# bubblewrap: every preview and thumbnail renders inside a bwrap sandbox and
+# Strata fails closed without it. gvfs: Trash, Devices and network locations.
+Recommends:
+ bubblewrap,
+ gstreamer1.0-plugins-base,
+ gstreamer1.0-plugins-good,
+ gvfs,
+Suggests:
+ ffmpeg,
+ ffmpegthumbnailer,
+ gstreamer1.0-libav,
+ gvfs-backends,
+ imagemagick,
+ libraw-bin,
+ squashfs-tools,
+ xdg-terminal-exec,
+Description: fast, keyboard-first file manager with Miller columns
+ Strata is a GTK 4 file manager built around Miller columns and the
+ keyboard, with inline previews for text, source code, Markdown, images,
+ PDFs, media and archives.
+ .
+ This package installs the official upstream release binary unmodified.
+ Previews need bubblewrap; Trash, Devices and network locations need gvfs.
