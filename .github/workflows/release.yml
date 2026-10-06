@@ -32,7 +32,7 @@ jobs:
     outputs:
       sources: ${{ steps.s.outputs.sources }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: s
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,8 +59,8 @@ jobs:
     if: always() && needs.select.outputs.sources != '[]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: deb-*
           path: artifacts

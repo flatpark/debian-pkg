@@ -21,7 +21,7 @@ jobs:
     outputs:
       sources: ${{ steps.s.outputs.sources }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: s
         run: echo "sources=$(scripts/select-sources.sh updatable)" >> "$GITHUB_OUTPUT"
 
@@ -37,7 +37,7 @@ jobs:
       SRC: ${{ matrix.source }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve
         id: bump
