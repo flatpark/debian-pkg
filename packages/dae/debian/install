@@ -1,0 +1,5 @@
+usr/bin/dae usr/bin/
+usr/lib/systemd/system/dae.service usr/lib/systemd/system/
+usr/share/dae/geoip.dat usr/share/dae/
+usr/share/dae/geosite.dat usr/share/dae/
+etc/dae/example.dae etc/dae/
