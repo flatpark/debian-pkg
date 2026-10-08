@@ -25,6 +25,7 @@ both current through later upgrades.
 
 | Package | What | Built from |
 | --- | --- | --- |
+| [dae](packages/dae/) | dae, eBPF transparent proxy + `dae.service` | upstream release binary, repackaged |
 | [scx](packages/scx/) | sched_ext CPU schedulers + `scx.service` | source (release tag) |
 | [scx-loader](packages/scx-loader/) | `scx_loader` daemon, `scxctl`, `scxtui` | source (release tag) |
 | [strata](packages/strata/) | Strata, keyboard-first GTK 4 file manager | upstream release binary, repackaged |

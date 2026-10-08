@@ -1,0 +1,24 @@
+Source: dae
+Section: net
+Priority: optional
+Maintainer: Komh <mail@guojing.io>
+Standards-Version: 4.7.3
+Build-Depends: debhelper-compat (= 13),
+Rules-Requires-Root: no
+Homepage: https://github.com/daeuniverse/dae
+
+Package: dae
+Architecture: amd64
+# Statically linked Go binary: no shared-library dependencies.
+Depends:
+ ${misc:Depends},
+Description: eBPF-based high-performance transparent proxy
+ dae ("Great") is a transparent proxy for Linux that steers traffic in the
+ kernel with eBPF: direct traffic bypasses the userspace proxy entirely,
+ and split routing works per process, domain, IP and MAC address. It speaks
+ Shadowsocks, VMess, VLESS (Reality), Trojan, Tuic, Juicity, Hysteria2,
+ HTTP(S), SOCKS5 and NaïveProxy, with proxy subscriptions and DNS routing.
+ .
+ This package installs the official upstream release binary unmodified,
+ together with the bundled v2fly geoip/geosite databases. It needs a
+ kernel with BTF and eBPF support (5.17 or newer).

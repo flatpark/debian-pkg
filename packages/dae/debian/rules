@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# Repack of the upstream release binary. It is installed byte-identical to the
+# published artifact (no strip, no dwz).
+
+%:
+	dh $@
+
+override_dh_strip override_dh_dwz:
+
+# dae.service runs /etc/dae/config.dae, which the user has to write first, so
+# the unit is not enabled on install. Once enabled, upgrades restart it.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable
+
+# dae refuses a config that is group-writable or readable by others; keep
+# upstream's 0640 so `cp -p example.dae config.dae` yields a usable file.
+execute_after_dh_fixperms:
+	chmod 0640 debian/dae/etc/dae/example.dae
