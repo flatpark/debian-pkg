@@ -60,25 +60,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Flat download: download-artifact@v8 extracts a lone matching artifact
+      # straight into `path` (no deb-<src>/ subdirectory), so the layout
+      # depends on how many builds succeeded. Each build leaves a
+      # <tag>.packages index naming its own .debs, which is all we need.
       - uses: actions/download-artifact@v8
         with:
           pattern: deb-*
           path: artifacts
+          merge-multiple: true
       - name: Create releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           . scripts/lib.sh
           shopt -s nullglob
-          for dir in artifacts/deb-*; do
-            src="${dir#artifacts/deb-}"
-            tag="$(release_tag "$src")"
+          indexes=(artifacts/*.packages)
+          [ ${#indexes[@]} -gt 0 ] || die "no build artifacts to release"
+          for idx in "${indexes[@]}"; do
+            tag="$(basename "$idx" .packages)"
+            read -r src _ <<<"$(parse_tag "$tag")"
             if gh release view "$tag" >/dev/null 2>&1; then
               echo "$tag already released"; continue
             fi
+            debs=($(sed -n 's|^Filename: .*/||p' "$idx" | sed 's|^|artifacts/|'))
+            [ ${#debs[@]} -gt 0 ] || die "$tag: no .debs listed in $idx"
             # Release notes: the top changelog entry.
             notes="$(awk 'NR > 2 && /^ -- / {exit} NR > 2' "packages/$src/debian/changelog")"
-            gh release create "$tag" "$dir"/* --target "$GITHUB_SHA" \
+            gh release create "$tag" "$idx" "${debs[@]}" --target "$GITHUB_SHA" \
               --title "$src $(deb_version "$src")" --notes "$notes"
           done
 
