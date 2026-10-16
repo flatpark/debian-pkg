@@ -7,7 +7,7 @@ Build-Depends: debhelper-compat (= 13), fakeroot,
  linux-libc-dev, bpftool,
  libbpf-dev (>= 1.4.0), binutils-dev, libelf-dev, libcap-dev, zlib1g-dev,
  libzstd-dev, libseccomp-dev, cmake, pkgconf, libssl-dev,
- cargo (>= 1.91), rustc (>= 1.91), clang, llvm, llvm-dev, jq,
+ cargo (>= 1.91), rustc (>= 1.91), clang, clang-22, llvm, llvm-dev, jq,
  protobuf-compiler
 Homepage: https://github.com/sched-ext/scx
 Vcs-Git: https://github.com/sched-ext/scx
