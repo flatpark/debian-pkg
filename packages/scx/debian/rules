@@ -19,7 +19,9 @@ CARGO_TEST_WORKSPACE_ARGS := $(CARGO_WORKSPACE_ARGS) --exclude scx_mitosis
 export RUSTC = /usr/bin/rustc
 export RUSTDOC = /usr/bin/rustdoc
 export CARGO = /usr/bin/cargo
-export BPF_CLANG = /usr/bin/clang
+# scx >= 1.1.4 refuses to build cid-form schedulers with clang < 22, and
+# sid's default clang still lags; pin the BPF compiler explicitly.
+export BPF_CLANG = /usr/bin/clang-22
 export TARGET = $(shell $(RUSTC) -vV | sed -n 's/^host: //p')
 
 %:
