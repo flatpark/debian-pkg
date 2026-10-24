@@ -4,6 +4,8 @@ flatpak (1.18.4-1+flatpark1) unstable; urgency=medium
     extra-data from the repository after deploy, add `flatpak clean`.
     Patches live in debian/patches/flatpark/, exported from the
     flatpark/1.18.4 branch of https://github.com/flatpark/flatpak.
+  * Drop the flatpak-tests binary package (and its autopkgtests): nobody
+    installs it, and without it the test suite is not even compiled.
 
  -- Komh <mail@guojing.io>  Sat, 24 Oct 2026 16:11:54 +0800
 

@@ -5,24 +5,3 @@ Restrictions:
 Depends:
  build-essential,
  libflatpak-dev,
-
-Tests:
- gnome-desktop-testing,
-Restrictions:
- isolation-machine,
-Depends:
- flatpak-tests,
- gettext,
- gnome-desktop-testing,
- python3,
-
-Tests:
- flaky,
-Restrictions:
- flaky,
- isolation-machine,
-Depends:
- flatpak-tests,
- gettext,
- gnome-desktop-testing,
- python3,

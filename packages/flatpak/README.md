@@ -14,6 +14,22 @@ The only thing the dropped cache was good for is redeploying the same commit
 without pulling (`--no-pull`); that now fails with "Extra data missing in
 detached metadata", and a normal reinstall fixes it.
 
+## Installing a local build
+
+The build produces Debian's usual split: `flatpak` (the CLI, system helper and
+portal), `libflatpak0` (for GNOME Software / Discover), and the development
+packages `libflatpak-dev`, `gir1.2-flatpak-1.0`, `libflatpak-doc`. On a desktop
+install only what is already there, normally just the CLI:
+
+```sh
+sudo apt install ./out/flatpak/flatpak_*.deb
+```
+
+Never `dpkg -i out/flatpak/*.deb`: dpkg does not resolve dependencies, so the
+development packages are left unconfigured and apt refuses to work until they
+are removed. The `flatpak` binary links the patched code statically, so the
+CLI alone carries every change.
+
 ## Where the code lives
 
 The patches are developed in the fork https://github.com/flatpark/flatpak, on
@@ -36,7 +52,9 @@ When sid moves to `<new>-N`:
 
 1. Replace `debian/` with Debian's packaging for `<new>-N` (from
    `https://deb.debian.org/debian/pool/main/f/flatpak/flatpak_<new>-N.debian.tar.xz`),
-   keeping `debian/patches/flatpark/`.
+   keeping `debian/patches/flatpark/`. Drop the `flatpak-tests` binary
+   package again: its stanza in `debian/control`, `flatpak-tests.*`, and the
+   autopkgtests in `debian/tests/` that depend on it.
 2. In the fork: `git switch -c flatpark/<new> <new>` and cherry-pick the
    commits from the previous `flatpark/<old>` branch.
 3. Prepend a `<new>-N+flatpark1` changelog entry, re-pin `meta.json`, run
