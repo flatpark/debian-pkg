@@ -1,0 +1,1126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Komh <mail@guojing.io>
+Date: Sat, 24 Oct 2026 16:24:11 +0800
+Subject: [PATCH] extra-data: prefetch downloads in parallel
+
+---
+ app/flatpak-builtins-config.c                |  31 ++
+ common/flatpak-dir-private.h                 |   3 +
+ common/flatpak-dir.c                         |  13 +
+ common/flatpak-extra-data-prefetch-private.h |  32 ++
+ common/flatpak-extra-data-prefetch.c         | 463 +++++++++++++++++++
+ common/flatpak-transaction.c                 |  64 +++
+ common/flatpak-utils-http-private.h          |  11 +
+ common/flatpak-utils-http.c                  |  46 +-
+ common/meson.build                           |   1 +
+ tests/meson.build                            |   2 +-
+ tests/test-config.sh                         |  13 +
+ tests/test-extra-data.sh                     |  93 +++-
+ tests/web-server.py                          |  54 ++-
+ 13 files changed, 804 insertions(+), 22 deletions(-)
+ create mode 100644 common/flatpak-extra-data-prefetch-private.h
+ create mode 100644 common/flatpak-extra-data-prefetch.c
+
+diff --git a/app/flatpak-builtins-config.c b/app/flatpak-builtins-config.c
+index 4ce8000a..5152de17 100644
+--- a/app/flatpak-builtins-config.c
++++ b/app/flatpak-builtins-config.c
+@@ -192,6 +192,30 @@ parse_boolean (const char  *value,
+     }
+ }
+ 
++static char *
++parse_non_negative_integer (const char *value,
++                            GError    **error)
++{
++  char *end = NULL;
++  guint64 parsed;
++
++  errno = 0;
++  parsed = g_ascii_strtoull (value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXINT)
++    {
++      flatpak_fail (error, _("'%s' is not a valid non-negative integer"), value);
++      return NULL;
++    }
++
++  return g_strdup (value);
++}
++
++static char *
++print_value (const char *value)
++{
++  return value ? g_strdup (value) : g_strdup ("*unset*");
++}
++
+ static char *
+ print_locale (const char *value)
+ {
+@@ -234,6 +258,12 @@ get_report_os_info_default (FlatpakDir *dir)
+   return g_strdup ("true");
+ }
+ 
++static char *
++get_extra_data_parallel_default (FlatpakDir *dir)
++{
++  return g_strdup ("4");
++}
++
+ typedef struct
+ {
+   const char *name;
+@@ -246,6 +276,7 @@ ConfigKey keys[] = {
+   { "languages", parse_lang, print_lang, get_lang_default },
+   { "extra-languages", parse_locale, print_locale, NULL },
+   { "report-os-info", parse_boolean, print_boolean, get_report_os_info_default },
++  { "extra-data-parallel", parse_non_negative_integer, print_value, get_extra_data_parallel_default },
+ };
+ 
+ static ConfigKey *
+diff --git a/common/flatpak-dir-private.h b/common/flatpak-dir-private.h
+index c7a47a8c..591d842b 100644
+--- a/common/flatpak-dir-private.h
++++ b/common/flatpak-dir-private.h
+@@ -25,6 +25,7 @@
+ 
+ #include "flatpak-common-types-private.h"
+ #include "flatpak-context-private.h"
++#include "flatpak-extra-data-prefetch-private.h"
+ #include "flatpak-progress-private.h"
+ #include "flatpak-variant-private.h"
+ #include "flatpak-ref-utils-private.h"
+@@ -577,6 +578,8 @@ gboolean              flatpak_dir_ensure_repo                               (Fla
+ gboolean              flatpak_dir_maybe_ensure_repo                         (FlatpakDir                    *self,
+                                                                              GCancellable                  *cancellable,
+                                                                              GError                       **error);
++void                  flatpak_dir_set_extra_data_prefetcher                 (FlatpakDir                    *self,
++                                                                             FlatpakExtraDataPrefetcher    *prefetcher);
+ char *                flatpak_dir_get_config                                (FlatpakDir                    *self,
+                                                                              const char                    *key,
+                                                                              GError                       **error);
+diff --git a/common/flatpak-dir.c b/common/flatpak-dir.c
+index 45970a68..cdc6e5c0 100644
+--- a/common/flatpak-dir.c
++++ b/common/flatpak-dir.c
+@@ -51,6 +51,7 @@
+ #include "flatpak-dir-private.h"
+ #include "flatpak-dir-utils-private.h"
+ #include "flatpak-error.h"
++#include "flatpak-extra-data-prefetch-private.h"
+ #include "flatpak-locale-utils-private.h"
+ #include "flatpak-image-collection-private.h"
+ #include "flatpak-image-source-private.h"
+@@ -265,6 +266,7 @@ struct FlatpakDir
+   GRegex          *pinned;
+ 
+   FlatpakHttpSession *http_session;
++  FlatpakExtraDataPrefetcher *extra_data_prefetcher;
+ };
+ 
+ G_LOCK_DEFINE_STATIC (config_cache);
+@@ -5211,6 +5213,13 @@ _flatpak_dir_reload_config (FlatpakDir   *self,
+   return TRUE;
+ }
+ 
++void
++flatpak_dir_set_extra_data_prefetcher (FlatpakDir                  *self,
++                                       FlatpakExtraDataPrefetcher *prefetcher)
++{
++  self->extra_data_prefetcher = prefetcher;
++}
++
+ char *
+ flatpak_dir_get_config (FlatpakDir *self,
+                         const char *key,
+@@ -6642,6 +6651,10 @@ flatpak_dir_pull_extra_data_to_bytes (FlatpakDir       *self,
+ 
+   expected_sha256 = ostree_checksum_from_bytes (expected_sha256_bytes);
+ 
++  if (self->extra_data_prefetcher != NULL)
++    flatpak_extra_data_prefetcher_wait (self->extra_data_prefetcher,
++                                        expected_sha256, progress, cancellable);
++
+   if (name == NULL || *name == '\0' ||
+       strcmp (name, ".") == 0 ||
+       strcmp (name, "..") == 0 ||
+diff --git a/common/flatpak-extra-data-prefetch-private.h b/common/flatpak-extra-data-prefetch-private.h
+new file mode 100644
+index 00000000..5a015e97
+--- /dev/null
++++ b/common/flatpak-extra-data-prefetch-private.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2025 FlatPark contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#ifndef __FLATPAK_EXTRA_DATA_PREFETCH_PRIVATE_H__
++#define __FLATPAK_EXTRA_DATA_PREFETCH_PRIVATE_H__
++
++#include "flatpak-common-types-private.h"
++#include "flatpak-progress-private.h"
++
++typedef struct _FlatpakExtraDataPrefetcher FlatpakExtraDataPrefetcher;
++
++FlatpakExtraDataPrefetcher *flatpak_extra_data_prefetcher_new (FlatpakDir *dir);
++FlatpakExtraDataPrefetcher *flatpak_extra_data_prefetcher_ref (FlatpakExtraDataPrefetcher *self);
++void flatpak_extra_data_prefetcher_unref (FlatpakExtraDataPrefetcher *self);
++
++gboolean flatpak_extra_data_prefetcher_is_enabled (FlatpakExtraDataPrefetcher *self);
++void flatpak_extra_data_prefetcher_add (FlatpakExtraDataPrefetcher *self,
++                                        gpointer                    operation,
++                                        GVariant                   *sources);
++void flatpak_extra_data_prefetcher_start (FlatpakExtraDataPrefetcher *self);
++gboolean flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
++                                             const char                 *sha256,
++                                             FlatpakProgress            *progress,
++                                             GCancellable               *cancellable);
++void flatpak_extra_data_prefetcher_operation_done (FlatpakExtraDataPrefetcher *self,
++                                                   gpointer                    operation);
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (FlatpakExtraDataPrefetcher, flatpak_extra_data_prefetcher_unref)
++
++#endif /* __FLATPAK_EXTRA_DATA_PREFETCH_PRIVATE_H__ */
+diff --git a/common/flatpak-extra-data-prefetch.c b/common/flatpak-extra-data-prefetch.c
+new file mode 100644
+index 00000000..550c4298
+--- /dev/null
++++ b/common/flatpak-extra-data-prefetch.c
+@@ -0,0 +1,463 @@
++/*
++ * Copyright 2025 FlatPark contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#include "config.h"
++
++#include <errno.h>
++#include <glib/gstdio.h>
++
++#include "flatpak-dir-private.h"
++#include "flatpak-extra-data-prefetch-private.h"
++#include "flatpak-repo-utils-private.h"
++#include "flatpak-utils-http-private.h"
++#include "flatpak-utils-private.h"
++
++#define DEFAULT_PARALLEL_DOWNLOADS 4
++#define MAX_DOWNLOADS_PER_HOST 4
++#define MAX_DOWNLOAD_ATTEMPTS 3
++
++typedef struct
++{
++  FlatpakExtraDataPrefetcher *prefetcher;
++  char                       *name;
++  char                       *uri;
++  char                       *sha256;
++  char                       *host;
++  guint64                     size;
++  guint64                     downloaded;
++  guint                       users;
++  gboolean                    done;
++  gboolean                    created;
++  GCond                       cond;
++} PrefetchJob;
++
++struct _FlatpakExtraDataPrefetcher
++{
++  gint          ref_count;
++  guint         parallel;
++  GMutex        mutex;
++  GCond         host_cond;
++  GHashTable   *jobs;
++  GPtrArray    *queue;
++  GHashTable   *operations;
++  GHashTable   *active_hosts;
++  GThreadPool  *pool;
++  GCancellable *cancellable;
++  gboolean      started;
++};
++
++static void
++prefetch_job_free (PrefetchJob *job)
++{
++  g_cond_clear (&job->cond);
++  g_free (job->name);
++  g_free (job->uri);
++  g_free (job->sha256);
++  g_free (job->host);
++  g_free (job);
++}
++
++static char *
++get_job_path (PrefetchJob *job,
++              gboolean     partial)
++{
++  g_autoptr(GFile) base = flatpak_get_user_base_dir_location ();
++  g_autoptr(GFile) file = NULL;
++  g_autofree char *name = partial ? g_strconcat (job->name, ".part", NULL) : g_strdup (job->name);
++
++  file = flatpak_build_file (base, "extra-data", job->sha256, name, NULL);
++  return g_file_get_path (file);
++}
++
++static void
++remove_job_file (PrefetchJob *job,
++                 gboolean     partial)
++{
++  g_autofree char *path = get_job_path (job, partial);
++  g_autofree char *dir = g_path_get_dirname (path);
++
++  if (g_unlink (path) != 0 && errno != ENOENT)
++    g_debug ("Unable to remove extra-data prefetch file %s: %s", path, g_strerror (errno));
++  if (g_rmdir (dir) != 0 && errno != ENOENT && errno != ENOTEMPTY)
++    g_debug ("Unable to remove extra-data prefetch directory %s: %s", dir, g_strerror (errno));
++}
++
++static void
++download_progress (guint64  downloaded,
++                   gpointer user_data)
++{
++  PrefetchJob *job = user_data;
++
++  g_mutex_lock (&job->prefetcher->mutex);
++  job->downloaded = downloaded;
++  g_mutex_unlock (&job->prefetcher->mutex);
++}
++
++static gboolean
++validate_download (const char  *path,
++                   PrefetchJob *job,
++                   GError     **error)
++{
++  g_autoptr(GFile) file = g_file_new_for_path (path);
++  g_autoptr(GFileInputStream) in = NULL;
++  g_autoptr(GFileInfo) info = NULL;
++  g_autoptr(GChecksum) checksum = g_checksum_new (G_CHECKSUM_SHA256);
++  guchar buffer[64 * 1024];
++  gssize n_read;
++
++  info = g_file_query_info (file, G_FILE_ATTRIBUTE_STANDARD_SIZE,
++                            G_FILE_QUERY_INFO_NONE, NULL, error);
++  if (info == NULL)
++    return FALSE;
++  if ((guint64) g_file_info_get_size (info) != job->size)
++    return flatpak_fail (error, "Wrong size for prefetched extra data %s", job->uri);
++
++  in = g_file_read (file, NULL, error);
++  if (in == NULL)
++    return FALSE;
++  while ((n_read = g_input_stream_read (G_INPUT_STREAM (in), buffer, sizeof buffer,
++                                        job->prefetcher->cancellable, error)) > 0)
++    g_checksum_update (checksum, buffer, n_read);
++  if (n_read < 0)
++    return FALSE;
++  if (strcmp (g_checksum_get_string (checksum), job->sha256) != 0)
++    return flatpak_fail (error, "Invalid checksum for prefetched extra data %s", job->uri);
++
++  return TRUE;
++}
++
++static gboolean
++acquire_host_slot (PrefetchJob *job)
++{
++  FlatpakExtraDataPrefetcher *self = job->prefetcher;
++  guint active;
++
++  g_mutex_lock (&self->mutex);
++  while (!g_cancellable_is_cancelled (self->cancellable) &&
++         GPOINTER_TO_UINT (g_hash_table_lookup (self->active_hosts, job->host)) >= MAX_DOWNLOADS_PER_HOST)
++    g_cond_wait (&self->host_cond, &self->mutex);
++
++  if (g_cancellable_is_cancelled (self->cancellable))
++    {
++      g_mutex_unlock (&self->mutex);
++      return FALSE;
++    }
++
++  active = GPOINTER_TO_UINT (g_hash_table_lookup (self->active_hosts, job->host));
++  g_hash_table_replace (self->active_hosts, g_strdup (job->host), GUINT_TO_POINTER (active + 1));
++  g_mutex_unlock (&self->mutex);
++  return TRUE;
++}
++
++static void
++release_host_slot (PrefetchJob *job)
++{
++  FlatpakExtraDataPrefetcher *self = job->prefetcher;
++  guint active;
++
++  g_mutex_lock (&self->mutex);
++  active = GPOINTER_TO_UINT (g_hash_table_lookup (self->active_hosts, job->host));
++  if (active <= 1)
++    g_hash_table_remove (self->active_hosts, job->host);
++  else
++    g_hash_table_replace (self->active_hosts, g_strdup (job->host), GUINT_TO_POINTER (active - 1));
++  g_cond_broadcast (&self->host_cond);
++  g_mutex_unlock (&self->mutex);
++}
++
++static void
++prefetch_worker (gpointer data,
++                 gpointer user_data)
++{
++  PrefetchJob *job = data;
++  FlatpakExtraDataPrefetcher *self = user_data;
++  g_autofree char *path = get_job_path (job, FALSE);
++  g_autofree char *part_path = get_job_path (job, TRUE);
++  g_autofree char *parent = g_path_get_dirname (path);
++  gboolean success = FALSE;
++  gboolean have_host_slot;
++
++  have_host_slot = acquire_host_slot (job);
++  if (have_host_slot && g_file_test (path, G_FILE_TEST_EXISTS))
++    success = TRUE;
++
++  for (guint attempt = 0; have_host_slot && !success && attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++)
++    {
++      g_autoptr(FlatpakHttpSession) session = flatpak_create_http_session (PACKAGE_STRING);
++      g_autoptr(GFile) part_file = g_file_new_for_path (part_path);
++      g_autoptr(GFileOutputStream) out = NULL;
++      g_autoptr(GError) local_error = NULL;
++
++      if (g_cancellable_is_cancelled (self->cancellable))
++        break;
++      if (g_mkdir_with_parents (parent, 0755) != 0)
++        {
++          g_debug ("Unable to create extra-data prefetch directory %s: %s", parent, g_strerror (errno));
++          break;
++        }
++
++      out = g_file_replace (part_file, NULL, FALSE, G_FILE_CREATE_PRIVATE,
++                            self->cancellable, &local_error);
++      if (out != NULL &&
++          flatpak_download_http_uri_with_retries (session, job->uri, NULL,
++                                                  FLATPAK_HTTP_FLAGS_NONE,
++                                                  G_OUTPUT_STREAM (out), NULL,
++                                                  download_progress, job, 0,
++                                                  self->cancellable, &local_error) &&
++          g_output_stream_close (G_OUTPUT_STREAM (out), self->cancellable, &local_error) &&
++          validate_download (part_path, job, &local_error))
++        {
++          g_autoptr(GFile) target = g_file_new_for_path (path);
++
++          if (g_file_move (part_file, target, G_FILE_COPY_NONE, self->cancellable,
++                           NULL, NULL, &local_error))
++            {
++              job->created = TRUE;
++              success = TRUE;
++            }
++          else if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_EXISTS))
++            {
++              g_clear_error (&local_error);
++              g_unlink (part_path);
++              success = TRUE;
++            }
++        }
++
++      if (!success)
++        {
++          g_debug ("Extra-data prefetch attempt %u failed for %s: %s",
++                   attempt + 1, job->uri, local_error ? local_error->message : "unknown error");
++          g_unlink (part_path);
++        }
++    }
++
++  if (have_host_slot)
++    release_host_slot (job);
++
++  g_mutex_lock (&self->mutex);
++  job->done = TRUE;
++  g_cond_broadcast (&job->cond);
++  g_mutex_unlock (&self->mutex);
++}
++
++static guint
++get_parallel_downloads (FlatpakDir *dir)
++{
++  const char *env = g_getenv ("FLATPAK_EXTRA_DATA_PARALLEL");
++  g_autofree char *configured = NULL;
++  const char *value = env;
++  char *end = NULL;
++  guint64 parsed;
++
++  if (value == NULL || *value == '\0')
++    {
++      configured = flatpak_dir_get_config (dir, "extra-data-parallel", NULL);
++      value = configured;
++    }
++  if (value == NULL)
++    return DEFAULT_PARALLEL_DOWNLOADS;
++
++  errno = 0;
++  parsed = g_ascii_strtoull (value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0' || parsed > G_MAXINT)
++    {
++      g_info ("Ignoring invalid extra-data parallelism value '%s'", value);
++      return DEFAULT_PARALLEL_DOWNLOADS;
++    }
++
++  return parsed;
++}
++
++FlatpakExtraDataPrefetcher *
++flatpak_extra_data_prefetcher_new (FlatpakDir *dir)
++{
++  FlatpakExtraDataPrefetcher *self = g_new0 (FlatpakExtraDataPrefetcher, 1);
++
++  self->ref_count = 1;
++  self->parallel = get_parallel_downloads (dir);
++  g_mutex_init (&self->mutex);
++  g_cond_init (&self->host_cond);
++  self->jobs = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, (GDestroyNotify) prefetch_job_free);
++  self->queue = g_ptr_array_new ();
++  self->operations = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, (GDestroyNotify) g_ptr_array_unref);
++  self->active_hosts = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++  self->cancellable = g_cancellable_new ();
++  return self;
++}
++
++FlatpakExtraDataPrefetcher *
++flatpak_extra_data_prefetcher_ref (FlatpakExtraDataPrefetcher *self)
++{
++  g_atomic_int_inc (&self->ref_count);
++  return self;
++}
++
++void
++flatpak_extra_data_prefetcher_unref (FlatpakExtraDataPrefetcher *self)
++{
++  GHashTableIter iter;
++  gpointer value;
++
++  if (!g_atomic_int_dec_and_test (&self->ref_count))
++    return;
++
++  g_cancellable_cancel (self->cancellable);
++  g_mutex_lock (&self->mutex);
++  g_cond_broadcast (&self->host_cond);
++  g_mutex_unlock (&self->mutex);
++  if (self->pool != NULL)
++    g_thread_pool_free (self->pool, FALSE, TRUE);
++
++  g_hash_table_iter_init (&iter, self->jobs);
++  while (g_hash_table_iter_next (&iter, NULL, &value))
++    {
++      PrefetchJob *job = value;
++      remove_job_file (job, TRUE);
++      if (job->created)
++        remove_job_file (job, FALSE);
++    }
++
++  g_hash_table_unref (self->operations);
++  g_ptr_array_unref (self->queue);
++  g_hash_table_unref (self->jobs);
++  g_hash_table_unref (self->active_hosts);
++  g_object_unref (self->cancellable);
++  g_cond_clear (&self->host_cond);
++  g_mutex_clear (&self->mutex);
++  g_free (self);
++}
++
++gboolean
++flatpak_extra_data_prefetcher_is_enabled (FlatpakExtraDataPrefetcher *self)
++{
++  return self->parallel > 1;
++}
++
++void
++flatpak_extra_data_prefetcher_add (FlatpakExtraDataPrefetcher *self,
++                                   gpointer                    operation,
++                                   GVariant                   *sources)
++{
++  GPtrArray *operation_jobs;
++
++  if (!flatpak_extra_data_prefetcher_is_enabled (self))
++    return;
++
++  operation_jobs = g_hash_table_lookup (self->operations, operation);
++  if (operation_jobs == NULL)
++    {
++      operation_jobs = g_ptr_array_new ();
++      g_hash_table_insert (self->operations, operation, operation_jobs);
++    }
++
++  for (gsize i = 0; i < g_variant_n_children (sources); i++)
++    {
++      const char *name = NULL;
++      const char *uri = NULL;
++      const guchar *sha_bytes = NULL;
++      guint64 size;
++      g_autofree char *sha256 = NULL;
++      g_autoptr(GUri) parsed_uri = NULL;
++      PrefetchJob *job;
++
++      flatpak_repo_parse_extra_data_sources (sources, i, &name, &size, NULL, &sha_bytes, &uri);
++      if (sha_bytes == NULL || name == NULL || *name == '\0' ||
++          strcmp (name, ".") == 0 || strcmp (name, "..") == 0 || strchr (name, '/') != NULL ||
++          (!g_str_has_prefix (uri, "http:") && !g_str_has_prefix (uri, "https:")))
++        continue;
++
++      sha256 = ostree_checksum_from_bytes (sha_bytes);
++      job = g_hash_table_lookup (self->jobs, sha256);
++      if (job == NULL)
++        {
++          parsed_uri = g_uri_parse (uri, G_URI_FLAGS_PARSE_RELAXED, NULL);
++          if (parsed_uri == NULL || g_uri_get_host (parsed_uri) == NULL)
++            continue;
++
++          job = g_new0 (PrefetchJob, 1);
++          job->prefetcher = self;
++          job->name = g_strdup (name);
++          job->uri = g_strdup (uri);
++          job->sha256 = g_steal_pointer (&sha256);
++          job->host = g_ascii_strdown (g_uri_get_host (parsed_uri), -1);
++          job->size = size;
++          g_cond_init (&job->cond);
++          g_hash_table_insert (self->jobs, job->sha256, job);
++          g_ptr_array_add (self->queue, job);
++        }
++      job->users++;
++      g_ptr_array_add (operation_jobs, job);
++    }
++}
++
++void
++flatpak_extra_data_prefetcher_start (FlatpakExtraDataPrefetcher *self)
++{
++  g_autoptr(GError) error = NULL;
++
++  if (!flatpak_extra_data_prefetcher_is_enabled (self) || self->started)
++    return;
++  self->started = TRUE;
++  self->pool = g_thread_pool_new (prefetch_worker, self, self->parallel, FALSE, &error);
++  if (self->pool == NULL)
++    {
++      g_info ("Unable to create extra-data prefetch pool: %s", error->message);
++      return;
++    }
++
++  for (guint i = 0; i < self->queue->len; i++)
++    g_thread_pool_push (self->pool, g_ptr_array_index (self->queue, i), NULL);
++}
++
++gboolean
++flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
++                                    const char                 *sha256,
++                                    FlatpakProgress            *progress,
++                                    GCancellable               *cancellable)
++{
++  PrefetchJob *job = g_hash_table_lookup (self->jobs, sha256);
++
++  if (job == NULL || self->pool == NULL)
++    return FALSE;
++
++  g_mutex_lock (&self->mutex);
++  while (!job->done &&
++         (cancellable == NULL || !g_cancellable_is_cancelled (cancellable)))
++    {
++      gint64 deadline = g_get_monotonic_time () + 100 * G_TIME_SPAN_MILLISECOND;
++      guint64 downloaded;
++
++      g_cond_wait_until (&job->cond, &self->mutex, deadline);
++      downloaded = job->downloaded;
++      g_mutex_unlock (&self->mutex);
++      flatpak_progress_update_extra_data (progress, downloaded);
++      g_mutex_lock (&self->mutex);
++    }
++  g_mutex_unlock (&self->mutex);
++  return TRUE;
++}
++
++void
++flatpak_extra_data_prefetcher_operation_done (FlatpakExtraDataPrefetcher *self,
++                                              gpointer                    operation)
++{
++  GPtrArray *jobs = g_hash_table_lookup (self->operations, operation);
++
++  if (jobs == NULL)
++    return;
++  for (guint i = 0; i < jobs->len; i++)
++    {
++      PrefetchJob *job = g_ptr_array_index (jobs, i);
++
++      g_assert (job->users > 0);
++      job->users--;
++      if (job->users == 0 && job->created)
++        {
++          remove_job_file (job, FALSE);
++          job->created = FALSE;
++        }
++    }
++  g_hash_table_remove (self->operations, operation);
++}
+diff --git a/common/flatpak-transaction.c b/common/flatpak-transaction.c
+index 98ed559f..e4ff8a56 100644
+--- a/common/flatpak-transaction.c
++++ b/common/flatpak-transaction.c
+@@ -26,6 +26,7 @@
+ #include "flatpak-auth-private.h"
+ #include "flatpak-dir-private.h"
+ #include "flatpak-error.h"
++#include "flatpak-extra-data-prefetch-private.h"
+ #include "flatpak-image-collection-private.h"
+ #include "flatpak-image-source-private.h"
+ #include "flatpak-installation-private.h"
+@@ -5436,6 +5437,59 @@ add_uninstall_unused_ops (FlatpakTransaction  *self,
+   return TRUE;
+ }
+ 
++static void
++prepare_extra_data_prefetch (FlatpakTransaction          *self,
++                             FlatpakExtraDataPrefetcher *prefetcher,
++                             GCancellable                *cancellable)
++{
++  FlatpakTransactionPrivate *priv = flatpak_transaction_get_instance_private (self);
++
++  if (priv->no_pull || !flatpak_extra_data_prefetcher_is_enabled (prefetcher))
++    return;
++
++  for (GList *l = priv->ops; l != NULL; l = l->next)
++    {
++      FlatpakTransactionOperation *op = l->data;
++      g_autoptr(FlatpakRemoteState) state = NULL;
++      g_autoptr(GVariant) commit = NULL;
++      g_autoptr(GVariant) sources = NULL;
++      g_autoptr(GError) local_error = NULL;
++
++      if (op->skip ||
++          (op->kind != FLATPAK_TRANSACTION_OPERATION_INSTALL &&
++           op->kind != FLATPAK_TRANSACTION_OPERATION_UPDATE) ||
++          op->bundle != NULL || op->resolved_image_source != NULL)
++        continue;
++
++      state = flatpak_transaction_ensure_remote_state (self, op->kind, op->remote,
++                                                       NULL, &local_error);
++      if (state == NULL || state->is_oci)
++        goto skip;
++
++      commit = flatpak_remote_state_load_ref_commit (state, priv->dir,
++                                                     flatpak_decomposed_get_ref (op->ref),
++                                                     op->resolved_commit,
++                                                     op->resolved_token,
++                                                     NULL, cancellable, &local_error);
++      if (commit == NULL)
++        goto skip;
++
++      sources = flatpak_commit_get_extra_data_sources (commit, &local_error);
++      if (sources == NULL)
++        goto skip;
++
++      flatpak_extra_data_prefetcher_add (prefetcher, op, sources);
++      continue;
++
++skip:
++      if (local_error != NULL)
++        g_debug ("Skipping extra-data prefetch for %s: %s",
++                 flatpak_decomposed_get_ref (op->ref), local_error->message);
++    }
++
++  flatpak_extra_data_prefetcher_start (prefetcher);
++}
++
+ static gboolean
+ flatpak_transaction_real_run (FlatpakTransaction *self,
+                               GCancellable       *cancellable,
+@@ -5448,6 +5502,7 @@ flatpak_transaction_real_run (FlatpakTransaction *self,
+   gboolean needs_triggers = FALSE;
+   gboolean needs_cache_drop = FALSE;
+   gboolean ready_res = FALSE;
++  g_autoptr(FlatpakExtraDataPrefetcher) prefetcher = NULL;
+   int i;
+ 
+   if (!priv->can_run)
+@@ -5579,6 +5634,10 @@ flatpak_transaction_real_run (FlatpakTransaction *self,
+   if (!ready_res)
+     return flatpak_fail_error (error, FLATPAK_ERROR_ABORTED, _("Aborted by user"));
+ 
++  prefetcher = flatpak_extra_data_prefetcher_new (priv->dir);
++  prepare_extra_data_prefetch (self, prefetcher, cancellable);
++  flatpak_dir_set_extra_data_prefetcher (priv->dir, prefetcher);
++
+   for (l = priv->ops; l != NULL; l = l->next)
+     {
+       FlatpakTransactionOperation *op = l->data;
+@@ -5620,6 +5679,8 @@ flatpak_transaction_real_run (FlatpakTransaction *self,
+       if (res)
+         {
+           g_autoptr(GBytes) deploy_data = NULL;
++
++          flatpak_extra_data_prefetcher_operation_done (prefetcher, op);
+           /* deploy v4 guarantees eol/eolr info */
+           deploy_data = flatpak_dir_get_deploy_data (priv->dir, op->ref, 4, NULL, NULL);
+ 
+@@ -5664,6 +5725,9 @@ flatpak_transaction_real_run (FlatpakTransaction *self,
+     }
+   priv->current_op = NULL;
+ 
++  flatpak_dir_set_extra_data_prefetcher (priv->dir, NULL);
++  g_clear_pointer (&prefetcher, flatpak_extra_data_prefetcher_unref);
++
+   if (needs_triggers)
+     flatpak_dir_run_triggers (priv->dir, cancellable, NULL);
+ 
+diff --git a/common/flatpak-utils-http-private.h b/common/flatpak-utils-http-private.h
+index a930ee79..65471bcc 100644
+--- a/common/flatpak-utils-http-private.h
++++ b/common/flatpak-utils-http-private.h
+@@ -81,6 +81,17 @@ GBytes * flatpak_load_uri (FlatpakHttpSession    *http_session,
+                            char                 **out_content_type,
+                            GCancellable          *cancellable,
+                            GError               **error);
++gboolean flatpak_download_http_uri_with_retries (FlatpakHttpSession    *http_session,
++                                                 const char            *uri,
++                                                 FlatpakCertificates   *certificates,
++                                                 FlatpakHTTPFlags       flags,
++                                                 GOutputStream         *out,
++                                                 const char            *token,
++                                                 FlatpakLoadUriProgress progress,
++                                                 gpointer               user_data,
++                                                 guint                  max_retries,
++                                                 GCancellable          *cancellable,
++                                                 GError               **error);
+ gboolean flatpak_download_http_uri (FlatpakHttpSession    *http_session,
+                                     const char            *uri,
+                                     FlatpakCertificates   *certificates,
+diff --git a/common/flatpak-utils-http.c b/common/flatpak-utils-http.c
+index 846b66ed..52354728 100644
+--- a/common/flatpak-utils-http.c
++++ b/common/flatpak-utils-http.c
+@@ -865,20 +865,21 @@ flatpak_load_uri (FlatpakHttpSession    *http_session,
+ }
+ 
+ gboolean
+-flatpak_download_http_uri (FlatpakHttpSession    *http_session,
+-                           const char            *uri,
+-                           FlatpakCertificates   *certificates,
+-                           FlatpakHTTPFlags       flags,
+-                           GOutputStream         *out,
+-                           const char            *token,
+-                           FlatpakLoadUriProgress progress,
+-                           gpointer               user_data,
+-                           GCancellable          *cancellable,
+-                           GError               **error)
++flatpak_download_http_uri_with_retries (FlatpakHttpSession    *http_session,
++                                         const char            *uri,
++                                         FlatpakCertificates   *certificates,
++                                         FlatpakHTTPFlags       flags,
++                                         GOutputStream         *out,
++                                         const char            *token,
++                                         FlatpakLoadUriProgress progress,
++                                         gpointer               user_data,
++                                         guint                  max_retries,
++                                         GCancellable          *cancellable,
++                                         GError               **error)
+ {
+   g_auto(LoadUriData) data = { NULL };
+   g_autoptr(GError) local_error = NULL;
+-  guint n_retries_remaining = DEFAULT_N_NETWORK_RETRIES;
++  guint n_retries_remaining = max_retries;
+   g_autoptr(GMainContextPopDefault) main_context = NULL;
+   gboolean success = FALSE;
+ 
+@@ -897,7 +898,7 @@ flatpak_download_http_uri (FlatpakHttpSession    *http_session,
+ 
+   do
+     {
+-      if (n_retries_remaining < DEFAULT_N_NETWORK_RETRIES)
++      if (n_retries_remaining < max_retries)
+         {
+           g_clear_error (&local_error);
+           reset_load_uri_data (&data);
+@@ -915,7 +916,8 @@ flatpak_download_http_uri (FlatpakHttpSession    *http_session,
+       if (data.downloaded_bytes > 0)
+         break;
+     }
+-  while (flatpak_http_should_retry_request (local_error, n_retries_remaining--));
++  while (n_retries_remaining > 0 &&
++         flatpak_http_should_retry_request (local_error, n_retries_remaining--));
+ 
+   if (success)
+     return TRUE;
+@@ -925,6 +927,24 @@ flatpak_download_http_uri (FlatpakHttpSession    *http_session,
+   return FALSE;
+ }
+ 
++gboolean
++flatpak_download_http_uri (FlatpakHttpSession    *http_session,
++                           const char            *uri,
++                           FlatpakCertificates   *certificates,
++                           FlatpakHTTPFlags       flags,
++                           GOutputStream         *out,
++                           const char            *token,
++                           FlatpakLoadUriProgress progress,
++                           gpointer               user_data,
++                           GCancellable          *cancellable,
++                           GError               **error)
++{
++  return flatpak_download_http_uri_with_retries (http_session, uri, certificates,
++                                                  flags, out, token, progress,
++                                                  user_data, DEFAULT_N_NETWORK_RETRIES,
++                                                  cancellable, error);
++}
++
+ /************************************************************************
+  *                        Cached http support                           *
+  ***********************************************************************/
+diff --git a/common/meson.build b/common/meson.build
+index 3e5f725c..969518fc 100644
+--- a/common/meson.build
++++ b/common/meson.build
+@@ -187,6 +187,7 @@ sources = [
+   'flatpak-dir-utils.c',
+   'flatpak-docker-reference.c',
+   'flatpak-error.c',
++  'flatpak-extra-data-prefetch.c',
+   'flatpak-exports.c',
+   'flatpak-glib-backports.c',
+   'flatpak-image-collection.c',
+diff --git a/tests/meson.build b/tests/meson.build
+index 41014150..8df184a8 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -442,7 +442,7 @@ foreach testcase : wrapped_tests
+     'test-summaries.sh' : 60,
+     'test-unused.sh' : 90,
+     'test-update-portal.sh' : 90,
+-    'test-extra-data.sh' : 90,
++    'test-extra-data.sh' : 180,
+   }.get(script, 30)
+ 
+   is_parallel = {
+diff --git a/tests/test-config.sh b/tests/test-config.sh
+index cf317ad6..3181f3bb 100755
+--- a/tests/test-config.sh
++++ b/tests/test-config.sh
+@@ -26,6 +26,7 @@ export LC_ALL=C
+ 
+ ${FLATPAK} config --list > list_out
+ assert_file_has_content list_out "^languages:"
++assert_file_has_content list_out "^extra-data-parallel: [*]unset[*] [(]default: 4[)]"
+ 
+ ok "config list"
+ 
+@@ -53,4 +54,16 @@ assert_file_has_content get_out "^[*]unset[*]"
+ 
+ ok "config unset"
+ 
++${FLATPAK} config --set extra-data-parallel 0
++${FLATPAK} config --get extra-data-parallel > get_out
++assert_file_has_content get_out "^0$"
++${FLATPAK} config --set extra-data-parallel 1
++if ${FLATPAK} config --set extra-data-parallel invalid >invalid_out 2>&1; then
++    fatal "Invalid extra-data parallelism unexpectedly accepted"
++fi
++assert_file_has_content invalid_out "not a valid non-negative integer"
++${FLATPAK} config --unset extra-data-parallel
++
++ok "config extra-data parallelism"
++
+ done_testing
+diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
+index 7095a72a..6791db4a 100755
+--- a/tests/test-extra-data.sh
++++ b/tests/test-extra-data.sh
+@@ -36,7 +36,9 @@ mkdir -p "${EXTRA_DATA_DIR}"
+ echo "extra-data-test-content" > "${EXTRA_DATA_DIR}/${EXTRA_DATA_FILE}"
+ 
+ # serve the extra data
+-httpd web-server.py "${EXTRA_DATA_DIR}"
++EVENTS_LOG="${TEST_DATA_DIR}/extra-data-events"
++touch "${EVENTS_LOG}"
++httpd web-server.py "${EXTRA_DATA_DIR}" "" "${EVENTS_LOG}"
+ EXTRA_DATA_URL="http://127.0.0.1:$(cat httpd-port)/${EXTRA_DATA_FILE}"
+ 
+ # download to get the size and sha256 sum
+@@ -55,11 +57,100 @@ install_repo ${REPONAME} ${BRANCH}
+ # ensure the right extra-data got downloaded
+ ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
+ assert_file_has_content out "extra-data-test-content"
++assert_not_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
+ 
+ ${FLATPAK} ${U} uninstall -y org.test.Hello >&2
+ 
+ ok "install extra data app with ostree"
+ 
++# A file supplied by the user must never be removed by the prefetcher.
++mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
++cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
++assert_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
++rm -rf "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
++ok "preserve user-provided extra data"
++
++make_parallel_extra_data_app () {
++    local number="$1"
++    local app_id="org.test.ExtraData${number}"
++    local file="parallel-${number}"
++    local size sha url extra
++
++    printf 'parallel extra data %s\n' "${number}" > "${EXTRA_DATA_DIR}/${file}"
++    echo 0.4 > "${EXTRA_DATA_DIR}/${file}.delay"
++    size=$(stat --printf="%s" "${EXTRA_DATA_DIR}/${file}")
++    sha=$(sha256sum "${EXTRA_DATA_DIR}/${file}" | cut -f1 -d' ')
++    url="http://127.0.0.1:$(cat httpd-port)/${file}"
++    extra="--extra-data=test:${sha}:${size}:${size}:${url}"
++    BUILD_FINISH_ARGS=${extra} make_updated_app ${REPONAME} ${COLLECTION_ID} ${BRANCH} UPDATE "${app_id}"
++}
++
++assert_parallel_requests () {
++    local expected="$1"
++    python3 - "${EVENTS_LOG}" "${expected}" <<'PY'
++import sys
++
++log, expected = sys.argv[1:]
++active = 0
++overlap = False
++with open(log) as source:
++    for line in source:
++        _, event, path = line.split()
++        if not path.startswith('/parallel-'):
++            continue
++        if event == 'start':
++            if active:
++                overlap = True
++            active += 1
++        else:
++            active -= 1
++if overlap != (expected == 'yes'):
++    raise SystemExit('request overlap was %s, expected %s' % (overlap, expected))
++PY
++}
++
++for number in 1 2 3; do
++    make_parallel_extra_data_app "${number}"
++done
++
++: > "${EVENTS_LOG}"
++${FLATPAK} ${U} install -y ${REPONAME}-repo \
++    org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2
++assert_parallel_requests yes
++${FLATPAK} ${U} uninstall -y \
++    org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2
++ok "prefetch extra data in parallel"
++
++: > "${EVENTS_LOG}"
++FLATPAK_EXTRA_DATA_PARALLEL=1 ${FLATPAK} ${U} install -y ${REPONAME}-repo \
++    org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2
++assert_parallel_requests no
++${FLATPAK} ${U} uninstall -y \
++    org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2
++ok "disable parallel extra data prefetch"
++
++# Transient prefetch failures are retried and do not fail the operation.
++echo "2 500" > "${EXTRA_DATA_DIR}/parallel-1.fail"
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.ExtraData1 >&2
++${FLATPAK} ${U} uninstall -y org.test.ExtraData1 >&2
++rm "${EXTRA_DATA_DIR}/parallel-1.fail"
++ok "retry failed extra data prefetch"
++
++# A permanent error still comes from the original pull path.
++MISSING_CONTENT="missing extra data"
++MISSING_SIZE=${#MISSING_CONTENT}
++MISSING_SHA=$(printf %s "${MISSING_CONTENT}" | sha256sum | cut -f1 -d' ')
++MISSING_URL="http://127.0.0.1:$(cat httpd-port)/permanently-missing"
++BUILD_FINISH_ARGS="--extra-data=test:${MISSING_SHA}:${MISSING_SIZE}:${MISSING_SIZE}:${MISSING_URL}" \
++    make_updated_app ${REPONAME} ${COLLECTION_ID} ${BRANCH} UPDATE org.test.ExtraDataMissing
++if ${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.ExtraDataMissing >missing-out 2>&1; then
++    fatal "Installing permanently missing extra data unexpectedly succeeded"
++fi
++assert_file_has_content missing-out "While downloading.*permanently-missing"
++ok "report permanent extra data failure"
++
+ # Start the fake registry server
+ 
+ httpd oci-registry-server.py --dir=.
+diff --git a/tests/web-server.py b/tests/web-server.py
+index 8ef04773..6e376e98 100755
+--- a/tests/web-server.py
++++ b/tests/web-server.py
+@@ -5,6 +5,7 @@ from email.utils import parsedate
+ from calendar import timegm
+ import gzip
+ import sys
++import threading
+ import time
+ import zlib
+ import os
+@@ -16,6 +17,37 @@ import sys
+ 
+ class RequestHandler(http_server.SimpleHTTPRequestHandler):
+     headers_log_file = None
++    events_log_file = None
++    control_lock = threading.Lock()
++
++    def log_event(self, event):
++        if self.events_log_file is not None:
++            with self.control_lock:
++                with open(self.events_log_file, 'a+') as f:
++                    f.write("%.6f %s %s\n" % (time.monotonic(), event, self.path))
++
++    def handle_test_controls(self):
++        path = self.translate_path(self.path)
++        fail_path = path + ".fail"
++        delay_path = path + ".delay"
++
++        if os.path.isfile(fail_path):
++            with self.control_lock:
++                with open(fail_path, 'r') as f:
++                    values = f.read().split()
++                remaining = int(values[0])
++                status = int(values[1]) if len(values) > 1 else 500
++                if remaining != 0:
++                    if remaining > 0:
++                        with open(fail_path, 'w') as f:
++                            f.write("%d %d\n" % (remaining - 1, status))
++                    self.send_error(status)
++                    return True
++
++        if os.path.isfile(delay_path):
++            with open(delay_path, 'r') as f:
++                time.sleep(float(f.read()))
++        return False
+ 
+     def handle_tokens(self):
+         need_token_path = self.translate_path(self.path) + ".need_token"
+@@ -48,15 +80,20 @@ class RequestHandler(http_server.SimpleHTTPRequestHandler):
+ 
+     def do_GET(self):
+         self.log_flatpak_headers()
+-        if self.handle_tokens():
+-            return None
+-        self.headers.__delitem__("If-Modified-Since")
+-        return super().do_GET()
++        self.log_event("start")
++        try:
++            if self.handle_tokens() or self.handle_test_controls():
++                return None
++            self.headers.__delitem__("If-Modified-Since")
++            return super().do_GET()
++        finally:
++            self.log_event("end")
+ 
+-def run(dir, headers_log=None):
++def run(dir, headers_log=None, events_log=None):
+     RequestHandler.protocol_version = "HTTP/1.0"
+     RequestHandler.headers_log_file = headers_log
+-    httpd = http_server.HTTPServer( ("127.0.0.1", 0), RequestHandler)
++    RequestHandler.events_log_file = events_log
++    httpd = http_server.ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
+     host, port = httpd.socket.getsockname()[:2]
+     with open("httpd-port", 'w') as file:
+         file.write("%d" % port)
+@@ -74,9 +111,12 @@ def run(dir, headers_log=None):
+ if __name__ == '__main__':
+     dir = None
+     headers_log = None
++    events_log = None
+     if len(sys.argv) >= 2 and len(sys.argv[1]) > 0:
+         dir = sys.argv[1]
+     if len(sys.argv) >= 3 and len(sys.argv[2]) > 0:
+         headers_log = sys.argv[2]
++    if len(sys.argv) >= 4 and len(sys.argv[3]) > 0:
++        events_log = sys.argv[3]
+ 
+-    run(dir, headers_log)
++    run(dir, headers_log, events_log)

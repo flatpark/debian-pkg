@@ -5,9 +5,12 @@
 #       packages touched between the two commits; every package when the
 #       shared build scripts changed
 #   scripts/select-sources.sh unreleased
-#       packages whose changelog version has no GitHub Release yet
+#       packages whose changelog version has no GitHub Release yet, except
+#       those with "publish": false in meta.json
 #   scripts/select-sources.sh updatable
-#       packages with a resolve-update.sh
+#       packages with a resolve-update.sh that update by PR (the default)
+#   scripts/select-sources.sh notify
+#       packages with a resolve-update.sh and "update": "issue" in meta.json
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -24,11 +27,18 @@ changed)
 unreleased)
     REPO="${GITHUB_REPOSITORY:-flatpark/debian-pkg}"
     for s in $(all_sources); do
+        if [ "$(meta_get "$s" '.publish')" = false ]; then continue; fi
         gh release view "$(release_tag "$s")" -R "$REPO" >/dev/null 2>&1 || echo "$s"
     done
     ;;
-updatable)
-    for s in $(all_sources); do [ -x "$ROOT/packages/$s/resolve-update.sh" ] && echo "$s"; done
+updatable|notify)
+    for s in $(all_sources); do
+        [ -x "$ROOT/packages/$s/resolve-update.sh" ] || continue
+        mode="$(meta_get "$s" '.update')"
+        if [ "$1" = notify ]; then want=issue; else want=pr; fi
+        if [ "$mode" = issue ]; then have=issue; else have=pr; fi
+        if [ "$have" = "$want" ]; then echo "$s"; fi
+    done
     ;;
-*) die "usage: $0 changed <base> <head> | unreleased | updatable" ;;
+*) die "usage: $0 changed <base> <head> | unreleased | updatable | notify" ;;
 esac | jq -Rnc '[inputs | select(length > 0)]'
