@@ -3,6 +3,12 @@ From: Komh <mail@guojing.io>
 Date: Sat, 24 Oct 2026 16:28:13 +0800
 Subject: [PATCH] deploy: discard embedded extra data after use
 
+Pulling an extra-data app stores the downloaded file in the commit's
+detached metadata (xa.extra-data), where it stays for as long as the
+commit does, although only the deploy reads it. Remove it once the app
+is deployed, keeping the commit's signatures. The only thing it was
+good for is redeploying the same commit without pulling (--no-pull);
+`flatpak config --set keep-extra-data true` keeps it.
 ---
  app/flatpak-builtins-config.c       |  7 +++
  common/flatpak-dir.c                | 15 ++++++
@@ -200,12 +206,12 @@ index 3181f3bb..170d5253 100755
  ok "config list"
  
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index 6791db4a..591eb730 100755
+index c5d31f51..3702853a 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
-@@ -59,10 +59,24 @@ ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
+@@ -60,10 +60,24 @@ ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
  assert_file_has_content out "extra-data-test-content"
- assert_not_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
+ assert_not_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}"
  
 +EXTRA_DATA_COMMIT=$(${FLATPAK} ${U} info --show-commit org.test.Hello)
 +ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
@@ -225,6 +231,6 @@ index 6791db4a..591eb730 100755
 +${FLATPAK} ${U} config --unset keep-extra-data
 +ok "keep extra data in detached metadata when configured"
 +
- # A file supplied by the user must never be removed by the prefetcher.
+ # A complete file left by an interrupted prefetch is reused and reclaimed.
  mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
- cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
+ touch "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/.flatpak-prefetch"

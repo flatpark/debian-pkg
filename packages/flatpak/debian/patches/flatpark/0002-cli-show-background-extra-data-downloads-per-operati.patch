@@ -3,35 +3,84 @@ From: Komh <mail@guojing.io>
 Date: Sat, 24 Oct 2026 18:15:15 +0800
 Subject: [PATCH] cli: show background extra-data downloads per operation
 
+The CLI only shows progress for the current operation, so extra-data
+being prefetched for the following ones looked idle. Every operation
+whose extra-data is downloading now gets the same spinner and its real
+downloaded / total size in the Download column; finished ones show their
+full size until they are installed.
 ---
- app/flatpak-cli-transaction.c                | 115 ++++++++++++++++++-
+ app/flatpak-cli-transaction.c                | 104 +++++++++++++++----
  common/flatpak-extra-data-prefetch-private.h |   8 ++
- common/flatpak-extra-data-prefetch.c         |  73 ++++++++++++
+ common/flatpak-extra-data-prefetch.c         |  73 +++++++++++++
  common/flatpak-transaction-private.h         |  14 +++
- common/flatpak-transaction.c                 |  44 +++++++
- tests/test-extra-data.sh                     |  12 ++
- 6 files changed, 263 insertions(+), 3 deletions(-)
+ common/flatpak-transaction.c                 |  44 ++++++++
+ tests/test-extra-data.sh                     |  12 +++
+ 6 files changed, 236 insertions(+), 19 deletions(-)
 
 diff --git a/app/flatpak-cli-transaction.c b/app/flatpak-cli-transaction.c
-index 6c310961..12a0ece3 100644
+index 6c310961..ac6db102 100644
 --- a/app/flatpak-cli-transaction.c
 +++ b/app/flatpak-cli-transaction.c
-@@ -278,6 +278,56 @@ format_duration (guint64 duration)
+@@ -248,9 +248,8 @@ set_op_progress (FlatpakCliTransaction       *self,
+     }
+ }
+ 
+-static void
+-spin_op_progress (FlatpakCliTransaction       *self,
+-                  FlatpakTransactionOperation *op)
++static const char *
++spinner_frame (int n)
+ {
+   const char *p[] = {
+     "|",
+@@ -259,7 +258,34 @@ spin_op_progress (FlatpakCliTransaction       *self,
+     "\\",
+   };
+ 
+-  set_op_progress (self, op, p[self->op_progress++ % G_N_ELEMENTS (p)]);
++  return p[n % G_N_ELEMENTS (p)];
++}
++
++static void
++spin_op_progress (FlatpakCliTransaction       *self,
++                  FlatpakTransactionOperation *op)
++{
++  set_op_progress (self, op, spinner_frame (self->op_progress++));
++}
++
++static void
++set_op_download (FlatpakCliTransaction       *self,
++                 FlatpakTransactionOperation *op,
++                 guint64                      transferred,
++                 guint64                      max)
++{
++  g_autofree char *formatted_max = NULL;
++  g_autofree char *formatted = NULL;
++  g_autofree char *text = NULL;
++  int row;
++
++  // avoid "bytes"
++  formatted = transferred < 1000 ? g_format_size (1000) : g_format_size (transferred);
++  formatted_max = max < 1000 ? g_format_size (1000) : g_format_size (max);
++
++  text = g_strdup_printf ("%s / %s", formatted, formatted_max);
++  row = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (op), "row"));
++  flatpak_table_printer_set_decimal_cell (self->printer, row, self->download_col, text);
+ }
+ 
+ static char *
+@@ -278,6 +304,45 @@ format_duration (guint64 duration)
      return g_strdup_printf ("%02d:%02d", m, s);
  }
  
++/* Operations whose extra-data is being prefetched in the background get
++ * the same spinner as the current one, and their real byte counts. */
 +static void
 +update_background_prefetch (FlatpakCliTransaction *self,
-+                            FlatpakTransaction    *transaction,
-+                            guint                 *out_downloading,
-+                            guint64               *out_downloaded,
-+                            guint64               *out_total)
++                            FlatpakTransaction    *transaction)
 +{
 +  g_autolist(FlatpakTransactionOperation) ops = flatpak_transaction_get_operations (transaction);
 +  GList *l;
-+  guint n_downloading = 0;
-+  guint64 downloaded_sum = 0;
-+  guint64 total_sum = 0;
 +
 +  for (l = ops; l != NULL; l = l->next)
 +    {
@@ -48,103 +97,57 @@ index 6c310961..12a0ece3 100644
 +                                                                &downloaded, &total);
 +      if (state == FLATPAK_PREFETCH_STATE_DOWNLOADING)
 +        {
-+          guint percent = total == 0 ? 0 : MIN ((guint) ((double) downloaded * 100 / total), 100);
-+          g_autofree char *text = g_strdup_printf ("%3u%%", percent);
-+
-+          set_op_progress (self, op, text);
-+          n_downloading++;
-+          downloaded_sum += downloaded;
-+          total_sum += total;
++          set_op_progress (self, op, spinner_frame (self->op_progress));
++          if (total > 0)
++            set_op_download (self, op, downloaded, total);
 +        }
 +      else if (state == FLATPAK_PREFETCH_STATE_DONE)
-+        set_op_progress (self, op, "100%");
++        {
++          set_op_progress (self, op, " ");
++          if (total > 0)
++            set_op_download (self, op, total, total);
++        }
 +      else
 +        set_op_progress (self, op, " ");
 +    }
-+
-+  if (out_downloading != NULL)
-+    *out_downloading = n_downloading;
-+  if (out_downloaded != NULL)
-+    *out_downloaded = downloaded_sum;
-+  if (out_total != NULL)
-+    *out_total = total_sum;
 +}
 +
  static void
  progress_changed_cb (FlatpakTransactionProgress *progress,
                       gpointer                    data)
-@@ -289,6 +339,8 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
-   int i;
-   int n_full, partial;
-   g_autofree char *speed = NULL;
-+  g_autofree char *background_summary = NULL;
-+  int fixed_length;
-   int bar_length;
-   const char *partial_blocks[] = {
-     " ",
-@@ -324,7 +376,51 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
+@@ -324,6 +389,9 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
  
    spin_op_progress (cli, op);
  
--  bar_length = MIN (20, cli->table_width - (strlen (cli->progress_msg) + 6 + cli->speed_len));
 +  if (flatpak_fancy_output ())
-+    {
-+      guint n_downloading;
-+      guint64 background_downloaded;
-+      guint64 background_total;
++    update_background_prefetch (cli, self);
 +
-+      update_background_prefetch (cli, self, &n_downloading,
-+                                  &background_downloaded, &background_total);
-+      if (n_downloading > 0)
-+        {
-+          g_autofree char *formatted_downloaded = g_format_size (background_downloaded);
-+          g_autofree char *formatted_total = g_format_size (background_total);
-+
-+          background_summary = g_strdup_printf (ngettext (" · %u more downloading, %s/%s",
-+                                                          " · %u more downloading, %s/%s",
-+                                                          n_downloading),
-+                                                n_downloading, formatted_downloaded, formatted_total);
-+        }
-+    }
-+
-+  fixed_length = (int) strlen (cli->progress_msg) + 6 + cli->speed_len;
-+  if (background_summary != NULL)
-+    {
-+      int available = MAX (0, cli->table_width - fixed_length);
-+      int max_summary = MAX (0, available - 5);
-+
-+      if (cell_width (background_summary) > max_summary)
-+        {
-+          g_autofree char *ellipsized = NULL;
-+
-+          if (max_summary < 2)
-+            g_clear_pointer (&background_summary, g_free);
-+          else
-+            {
-+              ellipsized = ellipsize_string (background_summary, max_summary);
-+              g_free (background_summary);
-+              background_summary = g_steal_pointer (&ellipsized);
-+            }
-+        }
-+    }
-+
-+  bar_length = MAX (0, cli->table_width - fixed_length);
-+  if (background_summary != NULL)
-+    bar_length -= cell_width (background_summary);
-+  bar_length = CLAMP (bar_length, 0, 20);
+   bar_length = MIN (20, cli->table_width - (strlen (cli->progress_msg) + 6 + cli->speed_len));
  
    n_full = (bar_length * percent) / 100;
-   partial = (((bar_length * percent) % 100) * G_N_ELEMENTS (partial_blocks)) / 100;
-@@ -360,6 +456,8 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
- 
-   if (speed)
-     g_string_append_printf (str, "  %s", speed);
-+  if (background_summary != NULL)
-+    g_string_append (str, background_summary);
- 
-   if (flatpak_fancy_output ())
+@@ -365,20 +433,7 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
      {
-@@ -405,6 +503,7 @@ new_operation (FlatpakTransaction          *transaction,
+       flatpak_table_printer_set_cell (cli->printer, cli->progress_row, 0, str->str);
+       if (flatpak_transaction_operation_get_operation_type (op) != FLATPAK_TRANSACTION_OPERATION_UNINSTALL)
+-        {
+-          g_autofree char *formatted_max = NULL;
+-          g_autofree char *formatted = NULL;
+-          g_autofree char *text = NULL;
+-          int row;
+-
+-          // avoid "bytes"
+-          formatted = transferred < 1000 ? g_format_size (1000) : g_format_size (transferred);
+-          formatted_max = max < 1000 ? g_format_size (1000) : g_format_size (max);
+-
+-          text = g_strdup_printf ("%s / %s", formatted, formatted_max);
+-          row = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (op), "row"));
+-          flatpak_table_printer_set_decimal_cell (cli->printer, row, cli->download_col, text);
+-        }
++        set_op_download (cli, op, transferred, max);
+       if (!redraw (cli))
+         g_print ("\r%s", str->str); /* redraw failed, just update the progress */
+       flatpak_pty_set_progress (percent);
+@@ -405,6 +460,7 @@ new_operation (FlatpakTransaction          *transaction,
  
    self->op++;
    self->op_progress = 0;
@@ -152,15 +155,15 @@ index 6c310961..12a0ece3 100644
  
    switch (op_type)
      {
-@@ -438,6 +537,7 @@ new_operation (FlatpakTransaction          *transaction,
+@@ -438,6 +494,7 @@ new_operation (FlatpakTransaction          *transaction,
    if (flatpak_fancy_output ())
      {
        set_progress (self, text);
-+      update_background_prefetch (self, transaction, NULL, NULL, NULL);
++      update_background_prefetch (self, transaction);
        spin_op_progress (self, op);
        redraw (self);
      }
-@@ -460,13 +560,18 @@ operation_done (FlatpakTransaction          *transaction,
+@@ -460,13 +517,18 @@ operation_done (FlatpakTransaction          *transaction,
    FlatpakCliTransaction *self = FLATPAK_CLI_TRANSACTION (transaction);
    FlatpakTransactionOperationType op_type = flatpak_transaction_operation_get_operation_type (op);
  
@@ -174,34 +177,25 @@ index 6c310961..12a0ece3 100644
    if (flatpak_fancy_output ())
 -    redraw (self);
 +    {
-+      update_background_prefetch (self, transaction, NULL, NULL, NULL);
++      update_background_prefetch (self, transaction);
 +      redraw (self);
 +    }
  }
  
  static gboolean
-@@ -484,6 +589,10 @@ operation_error (FlatpakTransaction            *transaction,
+@@ -484,6 +546,10 @@ operation_error (FlatpakTransaction            *transaction,
    const char *on = "";
    const char *off = "";
  
 +  g_object_set_data (G_OBJECT (op), "flatpak-cli-finished", GINT_TO_POINTER (1));
 +  if (flatpak_fancy_output ())
-+    update_background_prefetch (self, transaction, NULL, NULL, NULL);
++    update_background_prefetch (self, transaction);
 +
    if (flatpak_fancy_output ())
      {
        on = FLATPAK_ANSI_BOLD_ON;
-@@ -1421,7 +1530,7 @@ transaction_ready_pre_auth (FlatpakTransaction *transaction)
-   i = 0;
- 
-   flatpak_table_printer_set_column_title (printer, i++, "   ");
--  flatpak_table_printer_set_column_title (printer, i++, "   ");
-+  flatpak_table_printer_set_column_title (printer, i++, "      ");
- 
-   flatpak_table_printer_set_column_expand (printer, i, TRUE);
-   flatpak_table_printer_set_column_title (printer, i++, _("ID"));
 diff --git a/common/flatpak-extra-data-prefetch-private.h b/common/flatpak-extra-data-prefetch-private.h
-index 5a015e97..97f0e40a 100644
+index db864a47..3eb65210 100644
 --- a/common/flatpak-extra-data-prefetch-private.h
 +++ b/common/flatpak-extra-data-prefetch-private.h
 @@ -24,6 +24,14 @@ gboolean flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
@@ -218,12 +212,12 @@ index 5a015e97..97f0e40a 100644
 +                                                           guint64                    *out_total);
  void flatpak_extra_data_prefetcher_operation_done (FlatpakExtraDataPrefetcher *self,
                                                     gpointer                    operation);
- 
+ void flatpak_extra_data_prefetch_cleanup_on_signal (void);
 diff --git a/common/flatpak-extra-data-prefetch.c b/common/flatpak-extra-data-prefetch.c
-index 60200680..66121a63 100644
+index 8ccbe750..940fcfe9 100644
 --- a/common/flatpak-extra-data-prefetch.c
 +++ b/common/flatpak-extra-data-prefetch.c
-@@ -29,7 +29,9 @@ typedef struct
+@@ -38,7 +38,9 @@ typedef struct
    guint64                     size;
    guint64                     downloaded;
    guint                       users;
@@ -231,9 +225,9 @@ index 60200680..66121a63 100644
    gboolean                    done;
 +  gboolean                    success;
    gboolean                    created;
+   gboolean                    marked;
    GCond                       cond;
- } PrefetchJob;
-@@ -273,6 +275,13 @@ prefetch_worker (gpointer data,
+@@ -338,6 +340,13 @@ prefetch_worker (gpointer data,
          have_host_slot = acquire_host_slot (job);
      }
  
@@ -247,7 +241,7 @@ index 60200680..66121a63 100644
    for (guint attempt = 0; have_host_slot && !success && attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++)
      {
        g_autoptr(FlatpakHttpSession) session = flatpak_create_http_session (PACKAGE_STRING);
-@@ -322,7 +331,9 @@ prefetch_worker (gpointer data,
+@@ -387,7 +396,9 @@ prefetch_worker (gpointer data,
      release_host_slot (job);
  
    g_mutex_lock (&self->mutex);
@@ -257,7 +251,7 @@ index 60200680..66121a63 100644
    g_cond_broadcast (&job->cond);
    g_mutex_unlock (&self->mutex);
  }
-@@ -489,6 +500,16 @@ flatpak_extra_data_prefetcher_start (FlatpakExtraDataPrefetcher *self)
+@@ -557,6 +568,16 @@ flatpak_extra_data_prefetcher_start (FlatpakExtraDataPrefetcher *self)
    if (self->pool == NULL)
      {
        g_info ("Unable to create extra-data prefetch pool: %s", error->message);
@@ -274,7 +268,7 @@ index 60200680..66121a63 100644
        return;
      }
  
-@@ -524,6 +545,58 @@ flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
+@@ -592,6 +613,58 @@ flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
    return TRUE;
  }
  
@@ -435,10 +429,10 @@ index e4ff8a56..0bee4e50 100644
  
    if (needs_triggers)
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index 0642aa37..cd1c7da5 100755
+index 3947db6c..c5d31f51 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
-@@ -208,6 +208,18 @@ for number in 1 2 3; do
+@@ -141,6 +141,18 @@ for number in 1 2 3; do
      make_parallel_extra_data_app "${number}"
  done
  

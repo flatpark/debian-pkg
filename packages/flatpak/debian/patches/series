@@ -1,7 +1,5 @@
 debian/system-helper-Set-Debian-s-canonical-home-directory-for-s.patch
 flatpark/0001-extra-data-prefetch-downloads-in-parallel.patch
-flatpark/0002-deploy-discard-embedded-extra-data-after-use.patch
-flatpark/0003-cli-add-flatpak-clean-command.patch
-flatpark/0004-extra-data-mark-prefetched-files-so-leftovers-are-re.patch
-flatpark/0005-cli-show-background-extra-data-downloads-per-operati.patch
-flatpark/0006-cli-make-flatpak-clean-cover-user-and-system-install.patch
+flatpark/0002-cli-show-background-extra-data-downloads-per-operati.patch
+flatpark/0003-deploy-discard-embedded-extra-data-after-use.patch
+flatpark/0004-cli-add-flatpak-clean-command.patch
