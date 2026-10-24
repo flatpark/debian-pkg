@@ -2,8 +2,11 @@
 # Print a JSON array of package sources for a workflow matrix.
 #
 #   scripts/select-sources.sh changed <base-sha> <head-sha>
-#       packages touched between the two commits; every package when the
-#       shared build scripts changed
+#       packages touched between the two commits, plus the packages whose
+#       build the changed shared scripts take part in: build.sh,
+#       scripts/build-in-container.sh and scripts/lib.sh build every package,
+#       scripts/cargo/ only the packages whose fetch.sh uses it. Other scripts
+#       (selection, update checks, the apt index) build nothing.
 #   scripts/select-sources.sh unreleased
 #       packages whose changelog version has no GitHub Release yet, except
 #       those with "publish": false in meta.json
@@ -17,12 +20,20 @@ set -euo pipefail
 case "${1:-}" in
 changed)
     files="$(git -C "$ROOT" diff --name-only "$2" "$3")"
-    if grep -qE '^(build\.sh|scripts/)' <<<"$files"; then
-        all_sources
-    else
-        sed -n 's|^packages/\([^/]*\)/.*|\1|p' <<<"$files" | sort -u |
-            while read -r s; do [ -f "$ROOT/packages/$s/debian/changelog" ] && echo "$s"; done
-    fi
+    {
+        if grep -qxE 'build\.sh|scripts/build-in-container\.sh|scripts/lib\.sh' <<<"$files"; then
+            all_sources
+        fi
+        if grep -q '^scripts/cargo/' <<<"$files"; then
+            for s in $(all_sources); do
+                if grep -q 'scripts/cargo/' "$ROOT/packages/$s/fetch.sh"; then echo "$s"; fi
+            done
+        fi
+        sed -n 's|^packages/\([^/]*\)/.*|\1|p' <<<"$files" |
+            while read -r s; do
+                if [ -f "$ROOT/packages/$s/debian/changelog" ]; then echo "$s"; fi
+            done
+    } | sort -u
     ;;
 unreleased)
     REPO="${GITHUB_REPOSITORY:-flatpark/debian-pkg}"

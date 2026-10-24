@@ -1,7 +1,9 @@
 name: build
 
 # Builds one package in a debian:sid container (./build.sh): fetch, build,
-# install test, smoke test. Called by ci.yml and release.yml.
+# install test, smoke test. Called by ci.yml and release.yml, or run by hand
+# (gh workflow run build.yml -f source=<source>) to check a package no PR
+# built, e.g. one with "publish": false that release.yml skips.
 
 on:
   workflow_call:
@@ -11,6 +13,16 @@ on:
         required: true
       ref:
         description: 'Commit or branch to build (default: the triggering ref)'
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Package source name (packages/<source>)'
+        type: string
+        required: true
+      ref:
+        description: 'Commit or branch to build (default: the selected ref)'
         type: string
         default: ''
 
