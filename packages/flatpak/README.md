@@ -14,12 +14,17 @@ The only thing the dropped cache was good for is redeploying the same commit
 without pulling (`--no-pull`); that now fails with "Extra data missing in
 detached metadata", and a normal reinstall fixes it.
 
-## Installing a local build
+## Installing
+
+From apt.flatpark.org, an `apt upgrade` replaces Debian's packages with these
+(the `+flatpark` version sorts above sid's), only for the ones already
+installed; a fresh install is `sudo apt install flatpak`.
 
 The build produces Debian's usual split: `flatpak` (the CLI, system helper and
 portal), `libflatpak0` (for GNOME Software / Discover), and the development
-packages `libflatpak-dev`, `gir1.2-flatpak-1.0`, `libflatpak-doc`. On a desktop
-install only what is already there, normally just the CLI:
+packages `libflatpak-dev`, `gir1.2-flatpak-1.0`, `libflatpak-doc`. When
+installing a local build, install only what is already there, normally just
+the CLI:
 
 ```sh
 sudo apt install ./out/flatpak/flatpak_*.deb
@@ -46,8 +51,7 @@ packages/flatpak/sync-patches.sh   # fork defaults to ../flatpak
 `meta.json` sets `"update": "issue"`: an update means rebasing patches, which
 the daily bot cannot do, so when `resolve-update.sh` (sid's version) moves
 past the base of the changelog version, update-check opens an issue
-`flatpak: <new>-N available` instead of a PR. `"publish": false` keeps the
-package out of the apt repository; build it locally with `./build.sh flatpak`.
+`flatpak: <new>-N available` instead of a PR.
 When sid moves to `<new>-N`:
 
 1. Replace `debian/` with Debian's packaging for `<new>-N` (from

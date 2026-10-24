@@ -29,6 +29,7 @@ both current through later upgrades.
 | [scx](packages/scx/) | sched_ext CPU schedulers + `scx.service` | source (release tag) |
 | [scx-loader](packages/scx-loader/) | `scx_loader` daemon, `scxctl`, `scxtui` | source (release tag) |
 | [strata](packages/strata/) | Strata, keyboard-first GTK 4 file manager | upstream release binary, repackaged |
+| [flatpak](packages/flatpak/) | sid's flatpak + parallel extra-data downloads, no cached installers, `flatpak clean` | Debian packaging + FlatPark patches |
 | [flatpark-archive-keyring](packages/flatpark-archive-keyring/) | the repository's key and apt source | this repo |
 
 Each package directory has its own README with usage and packaging notes.
