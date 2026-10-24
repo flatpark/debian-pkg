@@ -1,0 +1,459 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Komh <mail@guojing.io>
+Date: Sat, 24 Oct 2026 18:15:15 +0800
+Subject: [PATCH] cli: show background extra-data downloads per operation
+
+---
+ app/flatpak-cli-transaction.c                | 115 ++++++++++++++++++-
+ common/flatpak-extra-data-prefetch-private.h |   8 ++
+ common/flatpak-extra-data-prefetch.c         |  73 ++++++++++++
+ common/flatpak-transaction-private.h         |  14 +++
+ common/flatpak-transaction.c                 |  44 +++++++
+ tests/test-extra-data.sh                     |  12 ++
+ 6 files changed, 263 insertions(+), 3 deletions(-)
+
+diff --git a/app/flatpak-cli-transaction.c b/app/flatpak-cli-transaction.c
+index 6c310961..12a0ece3 100644
+--- a/app/flatpak-cli-transaction.c
++++ b/app/flatpak-cli-transaction.c
+@@ -278,6 +278,56 @@ format_duration (guint64 duration)
+     return g_strdup_printf ("%02d:%02d", m, s);
+ }
+ 
++static void
++update_background_prefetch (FlatpakCliTransaction *self,
++                            FlatpakTransaction    *transaction,
++                            guint                 *out_downloading,
++                            guint64               *out_downloaded,
++                            guint64               *out_total)
++{
++  g_autolist(FlatpakTransactionOperation) ops = flatpak_transaction_get_operations (transaction);
++  GList *l;
++  guint n_downloading = 0;
++  guint64 downloaded_sum = 0;
++  guint64 total_sum = 0;
++
++  for (l = ops; l != NULL; l = l->next)
++    {
++      FlatpakTransactionOperation *op = l->data;
++      FlatpakPrefetchState state;
++      guint64 downloaded;
++      guint64 total;
++
++      if (g_object_get_data (G_OBJECT (op), "flatpak-cli-started") != NULL ||
++          g_object_get_data (G_OBJECT (op), "flatpak-cli-finished") != NULL)
++        continue;
++
++      state = flatpak_transaction_get_operation_prefetch_state (transaction, op,
++                                                                &downloaded, &total);
++      if (state == FLATPAK_PREFETCH_STATE_DOWNLOADING)
++        {
++          guint percent = total == 0 ? 0 : MIN ((guint) ((double) downloaded * 100 / total), 100);
++          g_autofree char *text = g_strdup_printf ("%3u%%", percent);
++
++          set_op_progress (self, op, text);
++          n_downloading++;
++          downloaded_sum += downloaded;
++          total_sum += total;
++        }
++      else if (state == FLATPAK_PREFETCH_STATE_DONE)
++        set_op_progress (self, op, "100%");
++      else
++        set_op_progress (self, op, " ");
++    }
++
++  if (out_downloading != NULL)
++    *out_downloading = n_downloading;
++  if (out_downloaded != NULL)
++    *out_downloaded = downloaded_sum;
++  if (out_total != NULL)
++    *out_total = total_sum;
++}
++
+ static void
+ progress_changed_cb (FlatpakTransactionProgress *progress,
+                      gpointer                    data)
+@@ -289,6 +339,8 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
+   int i;
+   int n_full, partial;
+   g_autofree char *speed = NULL;
++  g_autofree char *background_summary = NULL;
++  int fixed_length;
+   int bar_length;
+   const char *partial_blocks[] = {
+     " ",
+@@ -324,7 +376,51 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
+ 
+   spin_op_progress (cli, op);
+ 
+-  bar_length = MIN (20, cli->table_width - (strlen (cli->progress_msg) + 6 + cli->speed_len));
++  if (flatpak_fancy_output ())
++    {
++      guint n_downloading;
++      guint64 background_downloaded;
++      guint64 background_total;
++
++      update_background_prefetch (cli, self, &n_downloading,
++                                  &background_downloaded, &background_total);
++      if (n_downloading > 0)
++        {
++          g_autofree char *formatted_downloaded = g_format_size (background_downloaded);
++          g_autofree char *formatted_total = g_format_size (background_total);
++
++          background_summary = g_strdup_printf (ngettext (" · %u more downloading, %s/%s",
++                                                          " · %u more downloading, %s/%s",
++                                                          n_downloading),
++                                                n_downloading, formatted_downloaded, formatted_total);
++        }
++    }
++
++  fixed_length = (int) strlen (cli->progress_msg) + 6 + cli->speed_len;
++  if (background_summary != NULL)
++    {
++      int available = MAX (0, cli->table_width - fixed_length);
++      int max_summary = MAX (0, available - 5);
++
++      if (cell_width (background_summary) > max_summary)
++        {
++          g_autofree char *ellipsized = NULL;
++
++          if (max_summary < 2)
++            g_clear_pointer (&background_summary, g_free);
++          else
++            {
++              ellipsized = ellipsize_string (background_summary, max_summary);
++              g_free (background_summary);
++              background_summary = g_steal_pointer (&ellipsized);
++            }
++        }
++    }
++
++  bar_length = MAX (0, cli->table_width - fixed_length);
++  if (background_summary != NULL)
++    bar_length -= cell_width (background_summary);
++  bar_length = CLAMP (bar_length, 0, 20);
+ 
+   n_full = (bar_length * percent) / 100;
+   partial = (((bar_length * percent) % 100) * G_N_ELEMENTS (partial_blocks)) / 100;
+@@ -360,6 +456,8 @@ progress_changed_cb (FlatpakTransactionProgress *progress,
+ 
+   if (speed)
+     g_string_append_printf (str, "  %s", speed);
++  if (background_summary != NULL)
++    g_string_append (str, background_summary);
+ 
+   if (flatpak_fancy_output ())
+     {
+@@ -405,6 +503,7 @@ new_operation (FlatpakTransaction          *transaction,
+ 
+   self->op++;
+   self->op_progress = 0;
++  g_object_set_data (G_OBJECT (op), "flatpak-cli-started", GINT_TO_POINTER (1));
+ 
+   switch (op_type)
+     {
+@@ -438,6 +537,7 @@ new_operation (FlatpakTransaction          *transaction,
+   if (flatpak_fancy_output ())
+     {
+       set_progress (self, text);
++      update_background_prefetch (self, transaction, NULL, NULL, NULL);
+       spin_op_progress (self, op);
+       redraw (self);
+     }
+@@ -460,13 +560,18 @@ operation_done (FlatpakTransaction          *transaction,
+   FlatpakCliTransaction *self = FLATPAK_CLI_TRANSACTION (transaction);
+   FlatpakTransactionOperationType op_type = flatpak_transaction_operation_get_operation_type (op);
+ 
++  g_object_set_data (G_OBJECT (op), "flatpak-cli-finished", GINT_TO_POINTER (1));
++
+   if (op_type == FLATPAK_TRANSACTION_OPERATION_UNINSTALL)
+     set_op_progress (self, op, FLATPAK_ANSI_GREEN "-" FLATPAK_ANSI_COLOR_RESET);
+   else
+     set_op_progress (self, op, FLATPAK_ANSI_GREEN "✓" FLATPAK_ANSI_COLOR_RESET);
+ 
+   if (flatpak_fancy_output ())
+-    redraw (self);
++    {
++      update_background_prefetch (self, transaction, NULL, NULL, NULL);
++      redraw (self);
++    }
+ }
+ 
+ static gboolean
+@@ -484,6 +589,10 @@ operation_error (FlatpakTransaction            *transaction,
+   const char *on = "";
+   const char *off = "";
+ 
++  g_object_set_data (G_OBJECT (op), "flatpak-cli-finished", GINT_TO_POINTER (1));
++  if (flatpak_fancy_output ())
++    update_background_prefetch (self, transaction, NULL, NULL, NULL);
++
+   if (flatpak_fancy_output ())
+     {
+       on = FLATPAK_ANSI_BOLD_ON;
+@@ -1421,7 +1530,7 @@ transaction_ready_pre_auth (FlatpakTransaction *transaction)
+   i = 0;
+ 
+   flatpak_table_printer_set_column_title (printer, i++, "   ");
+-  flatpak_table_printer_set_column_title (printer, i++, "   ");
++  flatpak_table_printer_set_column_title (printer, i++, "      ");
+ 
+   flatpak_table_printer_set_column_expand (printer, i, TRUE);
+   flatpak_table_printer_set_column_title (printer, i++, _("ID"));
+diff --git a/common/flatpak-extra-data-prefetch-private.h b/common/flatpak-extra-data-prefetch-private.h
+index 5a015e97..97f0e40a 100644
+--- a/common/flatpak-extra-data-prefetch-private.h
++++ b/common/flatpak-extra-data-prefetch-private.h
+@@ -24,6 +24,14 @@ gboolean flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
+                                              const char                 *sha256,
+                                              FlatpakProgress            *progress,
+                                              GCancellable               *cancellable);
++void flatpak_extra_data_prefetcher_get_operation_progress (FlatpakExtraDataPrefetcher *self,
++                                                           gpointer                    operation,
++                                                           gboolean                   *out_found,
++                                                           gboolean                   *out_downloading,
++                                                           gboolean                   *out_done,
++                                                           gboolean                   *out_failed,
++                                                           guint64                    *out_downloaded,
++                                                           guint64                    *out_total);
+ void flatpak_extra_data_prefetcher_operation_done (FlatpakExtraDataPrefetcher *self,
+                                                    gpointer                    operation);
+ 
+diff --git a/common/flatpak-extra-data-prefetch.c b/common/flatpak-extra-data-prefetch.c
+index 60200680..66121a63 100644
+--- a/common/flatpak-extra-data-prefetch.c
++++ b/common/flatpak-extra-data-prefetch.c
+@@ -29,7 +29,9 @@ typedef struct
+   guint64                     size;
+   guint64                     downloaded;
+   guint                       users;
++  gboolean                    downloading;
+   gboolean                    done;
++  gboolean                    success;
+   gboolean                    created;
+   GCond                       cond;
+ } PrefetchJob;
+@@ -273,6 +275,13 @@ prefetch_worker (gpointer data,
+         have_host_slot = acquire_host_slot (job);
+     }
+ 
++  if (have_host_slot)
++    {
++      g_mutex_lock (&self->mutex);
++      job->downloading = TRUE;
++      g_mutex_unlock (&self->mutex);
++    }
++
+   for (guint attempt = 0; have_host_slot && !success && attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++)
+     {
+       g_autoptr(FlatpakHttpSession) session = flatpak_create_http_session (PACKAGE_STRING);
+@@ -322,7 +331,9 @@ prefetch_worker (gpointer data,
+     release_host_slot (job);
+ 
+   g_mutex_lock (&self->mutex);
++  job->downloading = FALSE;
+   job->done = TRUE;
++  job->success = success;
+   g_cond_broadcast (&job->cond);
+   g_mutex_unlock (&self->mutex);
+ }
+@@ -489,6 +500,16 @@ flatpak_extra_data_prefetcher_start (FlatpakExtraDataPrefetcher *self)
+   if (self->pool == NULL)
+     {
+       g_info ("Unable to create extra-data prefetch pool: %s", error->message);
++      g_mutex_lock (&self->mutex);
++      for (guint i = 0; i < self->queue->len; i++)
++        {
++          PrefetchJob *job = g_ptr_array_index (self->queue, i);
++
++          job->done = TRUE;
++          job->success = FALSE;
++          g_cond_broadcast (&job->cond);
++        }
++      g_mutex_unlock (&self->mutex);
+       return;
+     }
+ 
+@@ -524,6 +545,58 @@ flatpak_extra_data_prefetcher_wait (FlatpakExtraDataPrefetcher *self,
+   return TRUE;
+ }
+ 
++void
++flatpak_extra_data_prefetcher_get_operation_progress (FlatpakExtraDataPrefetcher *self,
++                                                       gpointer                    operation,
++                                                       gboolean                   *out_found,
++                                                       gboolean                   *out_downloading,
++                                                       gboolean                   *out_done,
++                                                       gboolean                   *out_failed,
++                                                       guint64                    *out_downloaded,
++                                                       guint64                    *out_total)
++{
++  GPtrArray *jobs;
++  gboolean downloading = FALSE;
++  gboolean done = TRUE;
++  gboolean failed = FALSE;
++  guint64 downloaded = 0;
++  guint64 total = 0;
++
++  *out_found = FALSE;
++  *out_downloading = FALSE;
++  *out_done = FALSE;
++  *out_failed = FALSE;
++  *out_downloaded = 0;
++  *out_total = 0;
++
++  g_mutex_lock (&self->mutex);
++  jobs = g_hash_table_lookup (self->operations, operation);
++  if (jobs == NULL || jobs->len == 0)
++    {
++      g_mutex_unlock (&self->mutex);
++      return;
++    }
++
++  for (guint i = 0; i < jobs->len; i++)
++    {
++      PrefetchJob *job = g_ptr_array_index (jobs, i);
++
++      total += job->size;
++      downloaded += job->done && job->success ? job->size : MIN (job->downloaded, job->size);
++      downloading |= job->downloading;
++      done &= job->done;
++      failed |= job->done && !job->success;
++    }
++  g_mutex_unlock (&self->mutex);
++
++  *out_found = TRUE;
++  *out_downloading = downloading;
++  *out_done = done;
++  *out_failed = failed;
++  *out_downloaded = downloaded;
++  *out_total = total;
++}
++
+ void
+ flatpak_extra_data_prefetcher_operation_done (FlatpakExtraDataPrefetcher *self,
+                                               gpointer                    operation)
+diff --git a/common/flatpak-transaction-private.h b/common/flatpak-transaction-private.h
+index d4971515..b920664d 100644
+--- a/common/flatpak-transaction-private.h
++++ b/common/flatpak-transaction-private.h
+@@ -32,6 +32,20 @@ FlatpakRemoteState *flatpak_transaction_ensure_remote_state (FlatpakTransaction
+ 
+ FlatpakDecomposed * flatpak_transaction_operation_get_decomposed (FlatpakTransactionOperation *self);
+ 
++typedef enum
++{
++  FLATPAK_PREFETCH_STATE_NONE,
++  FLATPAK_PREFETCH_STATE_QUEUED,
++  FLATPAK_PREFETCH_STATE_DOWNLOADING,
++  FLATPAK_PREFETCH_STATE_DONE,
++  FLATPAK_PREFETCH_STATE_FAILED,
++} FlatpakPrefetchState;
++
++FlatpakPrefetchState flatpak_transaction_get_operation_prefetch_state (FlatpakTransaction          *self,
++                                                                       FlatpakTransactionOperation *op,
++                                                                       guint64                     *out_downloaded,
++                                                                       guint64                     *out_total);
++
+ #include "flatpak-dir-private.h"
+ 
+ #endif /* __FLATPAK_TRANSACTION_PRIVATE_H__ */
+diff --git a/common/flatpak-transaction.c b/common/flatpak-transaction.c
+index e4ff8a56..0bee4e50 100644
+--- a/common/flatpak-transaction.c
++++ b/common/flatpak-transaction.c
+@@ -188,6 +188,7 @@ typedef struct _FlatpakTransactionPrivate
+   RequestData                 *active_request;
+ 
+   FlatpakTransactionOperation *current_op;
++  FlatpakExtraDataPrefetcher  *extra_data_prefetcher;
+ 
+   char                        *parent_window;
+   gboolean                     no_pull;
+@@ -4531,6 +4532,47 @@ flatpak_transaction_get_current_operation (FlatpakTransaction *self)
+   return NULL;
+ }
+ 
++FlatpakPrefetchState
++flatpak_transaction_get_operation_prefetch_state (FlatpakTransaction          *self,
++                                                   FlatpakTransactionOperation *op,
++                                                   guint64                     *out_downloaded,
++                                                   guint64                     *out_total)
++{
++  FlatpakTransactionPrivate *priv = flatpak_transaction_get_instance_private (self);
++  gboolean found;
++  gboolean downloading;
++  gboolean done;
++  gboolean failed;
++  guint64 downloaded;
++  guint64 total;
++
++  if (out_downloaded != NULL)
++    *out_downloaded = 0;
++  if (out_total != NULL)
++    *out_total = 0;
++  if (priv->extra_data_prefetcher == NULL)
++    return FLATPAK_PREFETCH_STATE_NONE;
++
++  flatpak_extra_data_prefetcher_get_operation_progress (priv->extra_data_prefetcher, op,
++                                                        &found, &downloading, &done, &failed,
++                                                        &downloaded, &total);
++  if (!found)
++    return FLATPAK_PREFETCH_STATE_NONE;
++
++  if (out_downloaded != NULL)
++    *out_downloaded = downloaded;
++  if (out_total != NULL)
++    *out_total = total;
++
++  if (failed)
++    return FLATPAK_PREFETCH_STATE_FAILED;
++  if (done)
++    return FLATPAK_PREFETCH_STATE_DONE;
++  if (downloading)
++    return FLATPAK_PREFETCH_STATE_DOWNLOADING;
++  return FLATPAK_PREFETCH_STATE_QUEUED;
++}
++
+ /**
+  * flatpak_transaction_get_operation_for_ref:
+  * @self: a #FlatpakTransaction
+@@ -5635,6 +5677,7 @@ flatpak_transaction_real_run (FlatpakTransaction *self,
+     return flatpak_fail_error (error, FLATPAK_ERROR_ABORTED, _("Aborted by user"));
+ 
+   prefetcher = flatpak_extra_data_prefetcher_new (priv->dir);
++  priv->extra_data_prefetcher = prefetcher;
+   prepare_extra_data_prefetch (self, prefetcher, cancellable);
+   flatpak_dir_set_extra_data_prefetcher (priv->dir, prefetcher);
+ 
+@@ -5726,6 +5769,7 @@ flatpak_transaction_real_run (FlatpakTransaction *self,
+   priv->current_op = NULL;
+ 
+   flatpak_dir_set_extra_data_prefetcher (priv->dir, NULL);
++  priv->extra_data_prefetcher = NULL;
+   g_clear_pointer (&prefetcher, flatpak_extra_data_prefetcher_unref);
+ 
+   if (needs_triggers)
+diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
+index 0642aa37..cd1c7da5 100755
+--- a/tests/test-extra-data.sh
++++ b/tests/test-extra-data.sh
+@@ -208,6 +208,18 @@ for number in 1 2 3; do
+     make_parallel_extra_data_app "${number}"
+ done
+ 
++if test -n "${FLATPAK_CLI_PROGRESS_CAPTURE:-}"; then
++    : > "${EVENTS_LOG}"
++    progress_command="env -u G_MESSAGES_DEBUG -u FLATPAK_FANCY_OUTPUT ${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3"
++    if test -n "${FLATPAK_CLI_PTY_HELPER:-}"; then
++        python3 "${FLATPAK_CLI_PTY_HELPER}" "${FLATPAK_CLI_PROGRESS_CAPTURE}" "${progress_command}"
++    else
++        script -qec "${progress_command}" "${FLATPAK_CLI_PROGRESS_CAPTURE}"
++    fi
++    ${FLATPAK} ${U} uninstall -y \
++        org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2
++fi
++
+ : > "${EVENTS_LOG}"
+ ${FLATPAK} ${U} install -y ${REPONAME}-repo \
+     org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2

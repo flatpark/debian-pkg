@@ -1,7 +1,6 @@
 {
   "automerge": false,
   "update": "issue",
-  "publish": false,
   "source": {
     "url": "https://github.com/flatpak/flatpak/releases/download/1.18.4/flatpak-1.18.4.tar.xz",
     "sha256": "b899a7a00c48d2c626cb8ec33fe556720b376c25805d7222430c0fdca4c6ac8d"
