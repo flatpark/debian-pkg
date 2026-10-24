@@ -1,0 +1,11 @@
+# FlatPark builds only flatpak and libflatpak0, not the development packages.
+usr/bin/flatpak-bisect
+usr/bin/flatpak-coredumpctl
+usr/include
+usr/lib/*/girepository-1.0
+usr/lib/*/libflatpak.so
+usr/lib/*/pkgconfig
+usr/share/dbus-1/interfaces
+usr/share/doc/flatpak/libflatpak-docs.html
+usr/share/gir-1.0
+usr/share/gtk-doc
