@@ -1,3 +1,16 @@
+flatpak (1.18.4-1+flatpark2) unstable; urgency=medium
+
+  * CLI: every app whose extra-data is downloading shows a spinner and its
+    real downloaded / total size, instead of a percentage plus a summary
+    after the progress bar.
+  * Interrupting an install or update (Ctrl-C) removes the extra-data it
+    had already downloaded.
+  * `flatpak clean` also removes what uninstalled apps, deleted remotes and
+    interrupted installs leave behind, and lists the data of uninstalled
+    apps (`--delete-data` deletes it).
+
+ -- Komh <mail@guojing.io>  Sat, 24 Oct 2026 18:46:18 +0800
+
 flatpak (1.18.4-1+flatpark1) unstable; urgency=medium
 
   * FlatPark build: download extra-data in parallel (shown per app in the

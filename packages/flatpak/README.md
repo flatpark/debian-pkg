@@ -8,7 +8,7 @@ and Discover pick up the changes too.
 | --- | --- |
 | Parallel extra-data downloads | A transaction downloads every app's extra-data up front, 4 at a time, while installs still run one by one. Tune with `flatpak config --set extra-data-parallel N` or `FLATPAK_EXTRA_DATA_PARALLEL=N`; `1` restores upstream behaviour. |
 | Drop cached extra-data after deploy | Upstream keeps each proprietary app's original download inside the repository (`xa.extra-data` in the commit's detached metadata) even though a reinstall downloads it again. It is now removed once the app is deployed; the commit's signature is kept. `flatpak config --set keep-extra-data true` keeps it. |
-| `flatpak clean` | Removes the cache above from existing installations (`--dry-run` to preview, `--system` as root). |
+| `flatpak clean` | Removes the cache above from existing installations, plus what flatpak never cleans up: interrupted downloads and deployments, empty ref directories of uninstalled apps and deleted remotes, unused bundle remotes. Lists the data of uninstalled apps; `--delete-data` deletes it. Covers user and system installations (`--dry-run` to preview; system as root). |
 
 The only thing the dropped cache was good for is redeploying the same commit
 without pulling (`--no-pull`); that now fails with "Extra data missing in

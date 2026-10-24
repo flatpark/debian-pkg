@@ -3,21 +3,39 @@ From: Komh <mail@guojing.io>
 Date: Sat, 24 Oct 2026 16:24:11 +0800
 Subject: [PATCH] extra-data: prefetch downloads in parallel
 
+A transaction downloads extra-data one operation at a time over a single
+connection. Once the transaction is ready, start downloading every
+operation's extra-data in a thread pool (4 at a time, at most 4 per
+host) while the operations still run in order; pulling extra-data then
+waits for the prefetched file instead of downloading it again. Failures
+fall back to the original download path.
+
+Downloads go to <user dir>/extra-data/<sha256>/<name>.part, are verified
+and renamed into place, and the directory gets a .flatpak-prefetch
+marker: a verified file left over by an interrupted run is reused, and
+everything is removed once the operation is done. SIGINT/SIGTERM/SIGHUP
+make flatpak _exit() from the signal handler, so the handler removes
+the prefetched files itself, with async-signal-safe calls only. Files
+the user put there (no marker) are never touched.
+
+Tunable with `flatpak config --set extra-data-parallel N` or
+FLATPAK_EXTRA_DATA_PARALLEL=N; 1 restores the serial behaviour.
 ---
- app/flatpak-builtins-config.c                |  31 ++
+ app/flatpak-builtins-config.c                |  31 +
+ app/flatpak-main.c                           |   2 +
  common/flatpak-dir-private.h                 |   3 +
  common/flatpak-dir.c                         |  13 +
- common/flatpak-extra-data-prefetch-private.h |  32 ++
- common/flatpak-extra-data-prefetch.c         | 463 +++++++++++++++++++
- common/flatpak-transaction.c                 |  64 +++
+ common/flatpak-extra-data-prefetch-private.h |  33 +
+ common/flatpak-extra-data-prefetch.c         | 616 +++++++++++++++++++
+ common/flatpak-transaction.c                 |  64 ++
  common/flatpak-utils-http-private.h          |  11 +
  common/flatpak-utils-http.c                  |  46 +-
  common/meson.build                           |   1 +
  tests/meson.build                            |   2 +-
  tests/test-config.sh                         |  13 +
- tests/test-extra-data.sh                     |  93 +++-
- tests/web-server.py                          |  54 ++-
- 13 files changed, 804 insertions(+), 22 deletions(-)
+ tests/test-extra-data.sh                     | 141 ++++-
+ tests/web-server.py                          |  54 +-
+ 14 files changed, 1007 insertions(+), 23 deletions(-)
  create mode 100644 common/flatpak-extra-data-prefetch-private.h
  create mode 100644 common/flatpak-extra-data-prefetch.c
 
@@ -77,6 +95,26 @@ index 4ce8000a..5152de17 100644
  };
  
  static ConfigKey *
+diff --git a/app/flatpak-main.c b/app/flatpak-main.c
+index d3fbe3bd..16efc2a2 100644
+--- a/app/flatpak-main.c
++++ b/app/flatpak-main.c
+@@ -41,6 +41,7 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (AutoPolkitSubject, g_object_unref)
+ 
+ #include "flatpak-builtins.h"
+ #include "flatpak-builtins-utils.h"
++#include "flatpak-extra-data-prefetch-private.h"
+ #include "flatpak-utils-private.h"
+ 
+ static int opt_verbose;
+@@ -926,6 +927,7 @@ complete (int    argc,
+ static void
+ handle_sigterm (int signum)
+ {
++  flatpak_extra_data_prefetch_cleanup_on_signal ();
+   flatpak_disable_raw_mode ();
+   flatpak_show_cursor ();
+   _exit (1);
 diff --git a/common/flatpak-dir-private.h b/common/flatpak-dir-private.h
 index c7a47a8c..591d842b 100644
 --- a/common/flatpak-dir-private.h
@@ -145,10 +183,10 @@ index 45970a68..cdc6e5c0 100644
        strcmp (name, "..") == 0 ||
 diff --git a/common/flatpak-extra-data-prefetch-private.h b/common/flatpak-extra-data-prefetch-private.h
 new file mode 100644
-index 00000000..5a015e97
+index 00000000..db864a47
 --- /dev/null
 +++ b/common/flatpak-extra-data-prefetch-private.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +/*
 + * Copyright 2025 FlatPark contributors
 + * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -177,16 +215,17 @@ index 00000000..5a015e97
 +                                             GCancellable               *cancellable);
 +void flatpak_extra_data_prefetcher_operation_done (FlatpakExtraDataPrefetcher *self,
 +                                                   gpointer                    operation);
++void flatpak_extra_data_prefetch_cleanup_on_signal (void);
 +
 +G_DEFINE_AUTOPTR_CLEANUP_FUNC (FlatpakExtraDataPrefetcher, flatpak_extra_data_prefetcher_unref)
 +
 +#endif /* __FLATPAK_EXTRA_DATA_PREFETCH_PRIVATE_H__ */
 diff --git a/common/flatpak-extra-data-prefetch.c b/common/flatpak-extra-data-prefetch.c
 new file mode 100644
-index 00000000..550c4298
+index 00000000..8ccbe750
 --- /dev/null
 +++ b/common/flatpak-extra-data-prefetch.c
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,616 @@
 +/*
 + * Copyright 2025 FlatPark contributors
 + * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -195,6 +234,8 @@ index 00000000..550c4298
 +#include "config.h"
 +
 +#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
 +#include <glib/gstdio.h>
 +
 +#include "flatpak-dir-private.h"
@@ -206,6 +247,8 @@ index 00000000..550c4298
 +#define DEFAULT_PARALLEL_DOWNLOADS 4
 +#define MAX_DOWNLOADS_PER_HOST 4
 +#define MAX_DOWNLOAD_ATTEMPTS 3
++#define MAX_SIGNAL_JOBS 256
++#define PREFETCH_MARKER ".flatpak-prefetch"
 +
 +typedef struct
 +{
@@ -214,13 +257,23 @@ index 00000000..550c4298
 +  char                       *uri;
 +  char                       *sha256;
 +  char                       *host;
++  /* Precomputed so the signal handler can clean up without allocating */
++  char                       *path;
++  char                       *part_path;
++  char                       *dir;
++  char                       *marker;
++  char                       *root;
 +  guint64                     size;
 +  guint64                     downloaded;
 +  guint                       users;
 +  gboolean                    done;
 +  gboolean                    created;
++  gboolean                    marked;
 +  GCond                       cond;
 +} PrefetchJob;
++
++/* Jobs of live prefetchers, for flatpak_extra_data_prefetch_cleanup_on_signal() */
++static PrefetchJob *signal_jobs[MAX_SIGNAL_JOBS];
 +
 +struct _FlatpakExtraDataPrefetcher
 +{
@@ -245,32 +298,140 @@ index 00000000..550c4298
 +  g_free (job->uri);
 +  g_free (job->sha256);
 +  g_free (job->host);
++  g_free (job->path);
++  g_free (job->part_path);
++  g_free (job->dir);
++  g_free (job->marker);
++  g_free (job->root);
 +  g_free (job);
 +}
 +
-+static char *
-+get_job_path (PrefetchJob *job,
-+              gboolean     partial)
++static void
++set_job_paths (PrefetchJob *job)
 +{
 +  g_autoptr(GFile) base = flatpak_get_user_base_dir_location ();
-+  g_autoptr(GFile) file = NULL;
-+  g_autofree char *name = partial ? g_strconcat (job->name, ".part", NULL) : g_strdup (job->name);
++  g_autoptr(GFile) root = g_file_get_child (base, "extra-data");
++  g_autoptr(GFile) dir = g_file_get_child (root, job->sha256);
++  g_autofree char *part_name = g_strconcat (job->name, ".part", NULL);
 +
-+  file = flatpak_build_file (base, "extra-data", job->sha256, name, NULL);
-+  return g_file_get_path (file);
++  job->root = g_file_get_path (root);
++  job->dir = g_file_get_path (dir);
++  job->path = g_build_filename (job->dir, job->name, NULL);
++  job->part_path = g_build_filename (job->dir, part_name, NULL);
++  job->marker = g_build_filename (job->dir, PREFETCH_MARKER, NULL);
++}
++
++static void
++register_signal_job (PrefetchJob *job)
++{
++  for (guint i = 0; i < MAX_SIGNAL_JOBS; i++)
++    if (g_atomic_pointer_compare_and_exchange (&signal_jobs[i], NULL, job))
++      return;
++}
++
++static void
++unregister_signal_job (PrefetchJob *job)
++{
++  for (guint i = 0; i < MAX_SIGNAL_JOBS; i++)
++    g_atomic_pointer_compare_and_exchange (&signal_jobs[i], job, NULL);
++}
++
++/* Called from a SIGINT/SIGTERM handler right before _exit(): drop whatever
++ * the running prefetchers downloaded. Only async-signal-safe calls. */
++void
++flatpak_extra_data_prefetch_cleanup_on_signal (void)
++{
++  for (guint i = 0; i < MAX_SIGNAL_JOBS; i++)
++    {
++      PrefetchJob *job = g_atomic_pointer_get (&signal_jobs[i]);
++
++      if (job == NULL)
++        continue;
++      unlink (job->part_path);
++      if (job->created)
++        unlink (job->path);
++      if (job->marked)
++        {
++          unlink (job->marker);
++          if (rmdir (job->dir) != 0)
++            {
++              /* Something else is in there, keep it marked as ours */
++              int fd = open (job->marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
++              if (fd >= 0)
++                close (fd);
++            }
++        }
++      rmdir (job->root);
++    }
++}
++
++static void
++remove_job_directory_if_empty (const char *dir)
++{
++  g_autoptr(GDir) d = NULL;
++  g_autofree char *marker = g_build_filename (dir, PREFETCH_MARKER, NULL);
++  const char *name;
++  gboolean have_marker = FALSE;
++
++  d = g_dir_open (dir, 0, NULL);
++  if (d == NULL)
++    return;
++
++  while ((name = g_dir_read_name (d)) != NULL)
++    {
++      if (strcmp (name, PREFETCH_MARKER) == 0)
++        have_marker = TRUE;
++      else
++        return;
++    }
++
++  if (have_marker && g_unlink (marker) != 0 && errno != ENOENT)
++    {
++      g_debug ("Unable to remove extra-data prefetch marker %s: %s", marker, g_strerror (errno));
++      return;
++    }
++  if (g_rmdir (dir) != 0 && errno != ENOENT && errno != ENOTEMPTY)
++    g_debug ("Unable to remove extra-data prefetch directory %s: %s", dir, g_strerror (errno));
 +}
 +
 +static void
 +remove_job_file (PrefetchJob *job,
 +                 gboolean     partial)
 +{
-+  g_autofree char *path = get_job_path (job, partial);
-+  g_autofree char *dir = g_path_get_dirname (path);
++  const char *path = partial ? job->part_path : job->path;
 +
 +  if (g_unlink (path) != 0 && errno != ENOENT)
 +    g_debug ("Unable to remove extra-data prefetch file %s: %s", path, g_strerror (errno));
-+  if (g_rmdir (dir) != 0 && errno != ENOENT && errno != ENOTEMPTY)
-+    g_debug ("Unable to remove extra-data prefetch directory %s: %s", dir, g_strerror (errno));
++  remove_job_directory_if_empty (job->dir);
++  g_rmdir (job->root);
++}
++
++static gboolean
++ensure_job_directory (const char  *dir,
++                      gboolean    *out_marked,
++                      GError     **error)
++{
++  g_autofree char *parent = g_path_get_dirname (dir);
++  g_autofree char *marker = g_build_filename (dir, PREFETCH_MARKER, NULL);
++
++  if (g_mkdir_with_parents (parent, 0755) != 0)
++    return glnx_throw_errno_prefix (error, "Unable to create extra-data directory %s", parent);
++
++  if (g_mkdir (dir, 0755) == 0)
++    {
++      if (!g_file_set_contents (marker, "", 0, error))
++        {
++          g_rmdir (dir);
++          return FALSE;
++        }
++      *out_marked = TRUE;
++    }
++  else if (errno == EEXIST)
++    *out_marked = g_file_test (marker, G_FILE_TEST_IS_REGULAR);
++  else
++    return glnx_throw_errno_prefix (error, "Unable to create extra-data prefetch directory %s", dir);
++
++  return TRUE;
 +}
 +
 +static void
@@ -362,15 +523,48 @@ index 00000000..550c4298
 +{
 +  PrefetchJob *job = data;
 +  FlatpakExtraDataPrefetcher *self = user_data;
-+  g_autofree char *path = get_job_path (job, FALSE);
-+  g_autofree char *part_path = get_job_path (job, TRUE);
-+  g_autofree char *parent = g_path_get_dirname (path);
++  const char *path = job->path;
++  const char *part_path = job->part_path;
 +  gboolean success = FALSE;
-+  gboolean have_host_slot;
++  gboolean marked = FALSE;
++  gboolean have_host_slot = FALSE;
++  g_autoptr(GError) setup_error = NULL;
 +
-+  have_host_slot = acquire_host_slot (job);
-+  if (have_host_slot && g_file_test (path, G_FILE_TEST_EXISTS))
-+    success = TRUE;
++  if (!ensure_job_directory (job->dir, &marked, &setup_error))
++    g_debug ("Unable to prepare extra-data prefetch for %s: %s", job->uri, setup_error->message);
++  else
++    {
++      job->marked = marked;
++      if (marked)
++        {
++          g_autoptr(GError) validation_error = NULL;
++
++          if (g_unlink (part_path) != 0 && errno != ENOENT)
++            g_debug ("Unable to remove partial extra-data prefetch file %s: %s",
++                     part_path, g_strerror (errno));
++          if (g_file_test (path, G_FILE_TEST_EXISTS))
++            {
++              if (validate_download (path, job, &validation_error))
++                {
++                  job->created = TRUE;
++                  success = TRUE;
++                }
++              else
++                {
++                  g_debug ("Discarding invalid extra-data prefetch file %s: %s",
++                           path, validation_error->message);
++                  if (g_unlink (path) != 0 && errno != ENOENT)
++                    g_debug ("Unable to remove invalid extra-data prefetch file %s: %s",
++                             path, g_strerror (errno));
++                }
++            }
++        }
++      else if (g_file_test (path, G_FILE_TEST_EXISTS))
++        success = TRUE;
++
++      if (!success)
++        have_host_slot = acquire_host_slot (job);
++    }
 +
 +  for (guint attempt = 0; have_host_slot && !success && attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++)
 +    {
@@ -381,11 +575,6 @@ index 00000000..550c4298
 +
 +      if (g_cancellable_is_cancelled (self->cancellable))
 +        break;
-+      if (g_mkdir_with_parents (parent, 0755) != 0)
-+        {
-+          g_debug ("Unable to create extra-data prefetch directory %s: %s", parent, g_strerror (errno));
-+          break;
-+        }
 +
 +      out = g_file_replace (part_file, NULL, FALSE, G_FILE_CREATE_PRIVATE,
 +                            self->cancellable, &local_error);
@@ -503,6 +692,7 @@ index 00000000..550c4298
 +  while (g_hash_table_iter_next (&iter, NULL, &value))
 +    {
 +      PrefetchJob *job = value;
++      unregister_signal_job (job);
 +      remove_job_file (job, TRUE);
 +      if (job->created)
 +        remove_job_file (job, FALSE);
@@ -572,7 +762,9 @@ index 00000000..550c4298
 +          job->sha256 = g_steal_pointer (&sha256);
 +          job->host = g_ascii_strdown (g_uri_get_host (parsed_uri), -1);
 +          job->size = size;
++          set_job_paths (job);
 +          g_cond_init (&job->cond);
++          register_signal_job (job);
 +          g_hash_table_insert (self->jobs, job->sha256, job);
 +          g_ptr_array_add (self->queue, job);
 +        }
@@ -918,7 +1110,7 @@ index cf317ad6..3181f3bb 100755
 +
  done_testing
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index 7095a72a..6791db4a 100755
+index 7095a72a..3947db6c 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
 @@ -36,7 +36,9 @@ mkdir -p "${EXTRA_DATA_DIR}"
@@ -932,21 +1124,56 @@ index 7095a72a..6791db4a 100755
  EXTRA_DATA_URL="http://127.0.0.1:$(cat httpd-port)/${EXTRA_DATA_FILE}"
  
  # download to get the size and sha256 sum
-@@ -55,11 +57,100 @@ install_repo ${REPONAME} ${BRANCH}
+@@ -46,7 +48,8 @@ EXTRA_DATA_SIZE=$(stat --printf="%s" "${DOWNLOADED_EXTRA_DATA}")
+ EXTRA_DATA_SHA256=$(sha256sum "${DOWNLOADED_EXTRA_DATA}" | cut -f1 -d' ')
+ 
+ # build the app with the extra data
+-EXTRA_DATA="--extra-data=test:${EXTRA_DATA_SHA256}:${EXTRA_DATA_SIZE}:${EXTRA_DATA_SIZE}:${EXTRA_DATA_URL}"
++EXTRA_DATA_NAME="test"
++EXTRA_DATA="--extra-data=${EXTRA_DATA_NAME}:${EXTRA_DATA_SHA256}:${EXTRA_DATA_SIZE}:${EXTRA_DATA_SIZE}:${EXTRA_DATA_URL}"
+ BUILD_FINISH_ARGS=${EXTRA_DATA} make_updated_app ${REPONAME} ${COLLECTION_ID} ${BRANCH} UPDATE1
+ 
+ # ensure it installs correctly
+@@ -55,11 +58,145 @@ install_repo ${REPONAME} ${BRANCH}
  # ensure the right extra-data got downloaded
  ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
  assert_file_has_content out "extra-data-test-content"
-+assert_not_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
++assert_not_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}"
  
  ${FLATPAK} ${U} uninstall -y org.test.Hello >&2
  
  ok "install extra data app with ostree"
  
++# A complete file left by an interrupted prefetch is reused and reclaimed.
++mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
++touch "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/.flatpak-prefetch"
++cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}"
++printf partial > "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}.part"
++: > "${EVENTS_LOG}"
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
++assert_not_file_has_content "${EVENTS_LOG}" "/${EXTRA_DATA_FILE}"
++assert_not_has_dir "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
++ok "reuse and reclaim interrupted extra data prefetch"
++
++# An invalid complete file left by an interrupted prefetch is downloaded again.
++mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
++touch "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/.flatpak-prefetch"
++printf invalid > "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}"
++: > "${EVENTS_LOG}"
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
++assert_file_has_content "${EVENTS_LOG}" "/${EXTRA_DATA_FILE}"
++assert_not_has_dir "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
++ok "replace invalid interrupted extra data prefetch"
++
 +# A file supplied by the user must never be removed by the prefetcher.
 +mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
-+cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
++cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}"
++: > "${EVENTS_LOG}"
 +${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
-+assert_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
++assert_not_file_has_content "${EVENTS_LOG}" "/${EXTRA_DATA_FILE}"
++assert_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_NAME}"
 +${FLATPAK} ${U} uninstall -y org.test.Hello >&2
 +rm -rf "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
 +ok "preserve user-provided extra data"
@@ -1016,6 +1243,26 @@ index 7095a72a..6791db4a 100755
 +${FLATPAK} ${U} uninstall -y org.test.ExtraData1 >&2
 +rm "${EXTRA_DATA_DIR}/parallel-1.fail"
 +ok "retry failed extra data prefetch"
++
++# Interrupting a transaction drops what the prefetcher downloaded.
++for number in 1 2 3; do
++    echo 30 > "${EXTRA_DATA_DIR}/parallel-${number}.delay"
++done
++rm -rf "${USERDIR}/extra-data"
++${FLATPAK} ${U} install -y ${REPONAME}-repo \
++    org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2 &
++install_pid=$!
++for _ in $(seq 100); do
++    test "$(find "${USERDIR}/extra-data" -name .flatpak-prefetch 2>/dev/null | wc -l)" -ge 2 && break
++    sleep 0.1
++done
++kill -INT "${install_pid}"
++wait "${install_pid}" || true
++assert_not_has_dir "${USERDIR}/extra-data"
++for number in 1 2 3; do
++    echo 0.4 > "${EXTRA_DATA_DIR}/parallel-${number}.delay"
++done
++ok "drop prefetched extra data on interrupt"
 +
 +# A permanent error still comes from the original pull path.
 +MISSING_CONTENT="missing extra data"
