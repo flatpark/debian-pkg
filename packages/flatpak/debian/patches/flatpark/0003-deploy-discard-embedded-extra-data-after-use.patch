@@ -10,14 +10,15 @@ is deployed, keeping the commit's signatures. The only thing it was
 good for is redeploying the same commit without pulling (--no-pull);
 `flatpak config --set keep-extra-data true` keeps it.
 ---
- app/flatpak-builtins-config.c       |  7 +++
- common/flatpak-dir.c                | 15 ++++++
- common/flatpak-extra-data-private.c | 72 +++++++++++++++++++++++++++++
- common/flatpak-extra-data-private.h | 18 ++++++++
- common/meson.build                  |  1 +
- tests/test-config.sh                |  1 +
- tests/test-extra-data.sh            | 14 ++++++
- 7 files changed, 128 insertions(+)
+ app/flatpak-builtins-config.c         |  7 +++
+ common/flatpak-dir.c                  | 15 ++++++
+ common/flatpak-extra-data-private.c   | 72 +++++++++++++++++++++++++++
+ common/flatpak-extra-data-private.h   | 18 +++++++
+ common/meson.build                    |  1 +
+ system-helper/flatpak-system-helper.c |  3 +-
+ tests/test-config.sh                  |  1 +
+ tests/test-extra-data.sh              | 14 ++++++
+ 8 files changed, 130 insertions(+), 1 deletion(-)
  create mode 100644 common/flatpak-extra-data-private.c
  create mode 100644 common/flatpak-extra-data-private.h
 
@@ -193,6 +194,20 @@ index 969518fc..90b55416 100644
    'flatpak-extra-data-prefetch.c',
    'flatpak-exports.c',
    'flatpak-glib-backports.c',
+diff --git a/system-helper/flatpak-system-helper.c b/system-helper/flatpak-system-helper.c
+index 7547c781..98afd7a2 100644
+--- a/system-helper/flatpak-system-helper.c
++++ b/system-helper/flatpak-system-helper.c
+@@ -1116,7 +1116,8 @@ handle_configure (FlatpakSystemHelper   *object,
+       (strcmp (arg_key, "extra-languages") != 0) &&
+       (strcmp (arg_key, "masked") != 0) &&
+       (strcmp (arg_key, "pinned") != 0) &&
+-      (strcmp (arg_key, "extra-data-parallel") != 0))
++      (strcmp (arg_key, "extra-data-parallel") != 0) &&
++      (strcmp (arg_key, "keep-extra-data") != 0))
+     {
+       g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+                                              "Unsupported key: %s", arg_key);
 diff --git a/tests/test-config.sh b/tests/test-config.sh
 index 3181f3bb..170d5253 100755
 --- a/tests/test-config.sh
@@ -206,7 +221,7 @@ index 3181f3bb..170d5253 100755
  ok "config list"
  
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index c5d31f51..3702853a 100755
+index 801ffabd..b126cb4a 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
 @@ -60,10 +60,24 @@ ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
