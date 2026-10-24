@@ -21,7 +21,7 @@ with a hint to run it as root. Writable repositories are cleaned under
 the exclusive locks prune takes. --dry-run reports without changing
 anything.
 ---
- app/flatpak-builtins-clean.c        | 843 ++++++++++++++++++++++++++++
+ app/flatpak-builtins-clean.c        | 863 ++++++++++++++++++++++++++++
  app/flatpak-builtins.h              |   1 +
  app/flatpak-main.c                  |   1 +
  app/meson.build                     |   1 +
@@ -31,17 +31,17 @@ anything.
  doc/flatpak-clean.xml               | 130 +++++
  doc/flatpak.xml                     |   7 +
  doc/meson.build                     |   1 +
- tests/test-extra-data.sh            | 100 +++-
- 11 files changed, 1089 insertions(+), 5 deletions(-)
+ tests/test-extra-data.sh            | 111 +++-
+ 11 files changed, 1120 insertions(+), 5 deletions(-)
  create mode 100644 app/flatpak-builtins-clean.c
  create mode 100644 doc/flatpak-clean.xml
 
 diff --git a/app/flatpak-builtins-clean.c b/app/flatpak-builtins-clean.c
 new file mode 100644
-index 00000000..c6e3f6a7
+index 00000000..32c6a57a
 --- /dev/null
 +++ b/app/flatpak-builtins-clean.c
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,863 @@
 +/* vi:set et sw=2 sts=2 cin cino=t0,f0,(0,{s,>2s,n-s,^-s,e-s:
 + * Copyright 2025 FlatPark contributors
 + * SPDX-License-Identifier: LGPL-2.1-or-later
@@ -287,13 +287,34 @@ index 00000000..c6e3f6a7
 +  return size;
 +}
 +
++static gboolean
++is_deploy_tmpdir (const char *name)
++{
++  /* flatpak_dir_deploy() checks out into ".<checksum>-XXXXXX" and renames
++   * it into place when done */
++  if (name[0] != '.' || strlen (name) < 1 + 64 + 7)
++    return FALSE;
++  for (int i = 1; i <= 64; i++)
++    if (!g_ascii_isxdigit (name[i]) || g_ascii_isupper (name[i]))
++      return FALSE;
++  return name[65] == '-';
++}
++
 +/* Removes the directories below @dir that hold nothing but other empty
 + * directories, and @dir itself if @remove_self. ostree and flatpak delete
-+ * refs and deployments but leave their parent directories behind. Returns
-+ * whether @dir is (or, with @dry_run, would be) empty afterwards. */
++ * refs and deployments but leave their parent directories behind.
++ *
++ * Only @max_depth levels below @dir are descended into (-1 for no limit);
++ * a directory at the limit counts as empty only if it has no entries at
++ * all, except deploy checkouts that @dry_run is about to remove. This
++ * must never reach into a deployment: its empty directories are mount
++ * points the sandbox needs.
++ *
++ * Returns whether @dir is (or, with @dry_run, would be) empty afterwards. */
 +static gboolean
 +clean_empty_dirs (GFile        *dir,
 +                  gboolean      remove_self,
++                  int           max_depth,
 +                  gboolean      dry_run,
 +                  GCancellable *cancellable,
 +                  guint        *removed)
@@ -314,12 +335,23 @@ index 00000000..c6e3f6a7
 +      GFileInfo *info;
 +      GFile *child;
 +
-+      if (!g_file_enumerator_iterate (enumerator, &info, &child, cancellable, NULL) ||
-+          info == NULL)
++      if (!g_file_enumerator_iterate (enumerator, &info, &child, cancellable, NULL))
++        {
++          empty = FALSE;
++          break;
++        }
++      if (info == NULL)
 +        break;
 +
-+      if (g_file_info_get_file_type (info) != G_FILE_TYPE_DIRECTORY ||
-+          !clean_empty_dirs (child, TRUE, dry_run, cancellable, removed))
++      if (g_file_info_get_file_type (info) != G_FILE_TYPE_DIRECTORY)
++        empty = FALSE;
++      else if (max_depth == 0)
++        {
++          if (!(dry_run && is_deploy_tmpdir (g_file_info_get_name (info))))
++            empty = FALSE;
++        }
++      else if (!clean_empty_dirs (child, TRUE, max_depth < 0 ? -1 : max_depth - 1,
++                                  dry_run, cancellable, removed))
 +        empty = FALSE;
 +    }
 +
@@ -331,19 +363,6 @@ index 00000000..c6e3f6a7
 +    }
 +
 +  return empty;
-+}
-+
-+static gboolean
-+is_deploy_tmpdir (const char *name)
-+{
-+  /* flatpak_dir_deploy() checks out into ".<checksum>-XXXXXX" and renames
-+   * it into place when done */
-+  if (name[0] != '.' || strlen (name) < 1 + 64 + 7)
-+    return FALSE;
-+  for (int i = 1; i <= 64; i++)
-+    if (!g_ascii_isxdigit (name[i]) || g_ascii_isupper (name[i]))
-+      return FALSE;
-+  return name[65] == '-';
 +}
 +
 +static gboolean
@@ -435,8 +454,9 @@ index 00000000..c6e3f6a7
 +            }
 +
 +          /* An install interrupted before its first deployment leaves
-+           * app/<id>/<arch>/<branch> with nothing in it */
-+          if (clean_empty_dirs (id_dir, TRUE, dry_run, cancellable, &empty_dirs))
++           * app/<id>/<arch>/<branch> with nothing in it. Only those three
++           * levels: never descend into the deployments themselves. */
++          if (clean_empty_dirs (id_dir, TRUE, 2, dry_run, cancellable, &empty_dirs))
 +            {
 +              g_autofree char *path = g_file_get_path (id_dir);
 +              report_item (0, path, objects, freed_bytes);
@@ -470,7 +490,7 @@ index 00000000..c6e3f6a7
 +  for (guint i = 0; i < G_N_ELEMENTS (ref_dirs); i++)
 +    {
 +      g_autoptr(GFile) refs = flatpak_build_file (repo_path, "refs", ref_dirs[i], NULL);
-+      clean_empty_dirs (refs, FALSE, dry_run, cancellable, &empty_ref_dirs);
++      clean_empty_dirs (refs, FALSE, -1, dry_run, cancellable, &empty_ref_dirs);
 +    }
 +  if (empty_ref_dirs > 0)
 +    {
@@ -1141,10 +1161,10 @@ index 9ef8eee1..43e4ab1f 100644
    'flatpak-uninstall',
    'flatpak-preinstall',
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index 3702853a..87438561 100755
+index b126cb4a..286b2b9f 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
-@@ -74,10 +74,106 @@ ${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
+@@ -74,10 +74,117 @@ ${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
  ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
  assert_file_has_content detached-keys "^xa.extra-data$"
  assert_file_has_content detached-keys "^ostree.gpgsigs$"
@@ -1176,8 +1196,12 @@ index 3702853a..87438561 100755
 +assert_has_file "${USERDIR}/extra-data/cleanup/orphan.part"
 +assert_has_file "${USERDIR}/extra-data/prefetch-cleanup/complete"
 +
++# Empty directories inside a deployment are mount points; keep them.
++HELLO_DEPLOY="$(${FLATPAK} ${U} info --show-location org.test.Hello)"
++mkdir -p "${HELLO_DEPLOY}/files/lib/GL/empty"
 +${FLATPAK} ${U} clean > clean-out
 +assert_file_has_content clean-out "Freed:"
++assert_has_dir "${HELLO_DEPLOY}/files/lib/GL/empty"
 +ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
 +assert_not_file_has_content detached-keys "^xa.extra-data$"
 +assert_file_has_content detached-keys "^ostree.gpgsigs$"
@@ -1199,28 +1223,35 @@ index 3702853a..87438561 100755
 +touch "${FL_DIR}/repo/state/$(printf %064d 1).commitpartial"
 +mkdir -p "${HOME}/.var/app/org.test.Gone"
 +printf data > "${HOME}/.var/app/org.test.Gone/file"
-+mkdir -p "${FL_DIR}/overrides"
-+printf '[Context]\nshared=network;\n' > "${FL_DIR}/overrides/org.test.Gone"
++mkdir -p "${USERDIR}/overrides"
++printf '[Context]\nshared=network;\n' > "${USERDIR}/overrides/org.test.Gone"
 +
 +${FLATPAK} ${U} clean --dry-run > clean-leftovers-out
 +assert_file_has_content clean-leftovers-out "org.test.Gone"
 +assert_has_dir "${FL_DIR}/repo/refs/remotes/deleted-remote"
 +assert_has_dir "${GONE_DEPLOY}"
 +
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
++HELLO_DEPLOY="$(${FLATPAK} ${U} info --show-location org.test.Hello)"
++mkdir -p "${HELLO_DEPLOY}/files/lib/GL"
 +${FLATPAK} ${U} clean > clean-leftovers-out
++assert_has_dir "${HELLO_DEPLOY}/files/lib/GL"
++${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
++assert_file_has_content out "extra-data-test-content"
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
 +assert_not_has_dir "${FL_DIR}/repo/refs/remotes/deleted-remote"
-+assert_not_has_dir "${FL_DIR}/repo/refs/heads/deploy/app"
++assert_not_has_dir "${FL_DIR}/repo/refs/heads/deploy/app/org.test.Gone"
 +assert_has_dir "${FL_DIR}/repo/refs/heads"
 +assert_not_has_dir "${FL_DIR}/app/org.test.Gone"
 +assert_not_has_file "${FL_DIR}/repo/state/$(printf %064d 1).commitpartial"
 +# The data of uninstalled apps is only listed by default
 +assert_file_has_content clean-leftovers-out "flatpak clean --delete-data"
 +assert_has_file "${HOME}/.var/app/org.test.Gone/file"
-+assert_has_file "${FL_DIR}/overrides/org.test.Gone"
++assert_has_file "${USERDIR}/overrides/org.test.Gone"
 +
 +${FLATPAK} ${U} clean --delete-data > clean-leftovers-out
 +assert_not_has_dir "${HOME}/.var/app/org.test.Gone"
-+assert_not_has_file "${FL_DIR}/overrides/org.test.Gone"
++assert_not_has_file "${USERDIR}/overrides/org.test.Gone"
 +ok "clean leftovers of uninstalled apps"
 +: > "${EVENTS_LOG}"
 +${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2

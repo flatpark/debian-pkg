@@ -429,7 +429,7 @@ index e4ff8a56..0bee4e50 100644
  
    if (needs_triggers)
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index 3947db6c..c5d31f51 100755
+index e9bbc6f5..801ffabd 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
 @@ -141,6 +141,18 @@ for number in 1 2 3; do

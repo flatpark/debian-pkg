@@ -31,11 +31,12 @@ FLATPAK_EXTRA_DATA_PARALLEL=N; 1 restores the serial behaviour.
  common/flatpak-utils-http-private.h          |  11 +
  common/flatpak-utils-http.c                  |  46 +-
  common/meson.build                           |   1 +
+ system-helper/flatpak-system-helper.c        |   3 +-
  tests/meson.build                            |   2 +-
  tests/test-config.sh                         |  13 +
- tests/test-extra-data.sh                     | 141 ++++-
+ tests/test-extra-data.sh                     | 145 ++++-
  tests/web-server.py                          |  54 +-
- 14 files changed, 1007 insertions(+), 23 deletions(-)
+ 15 files changed, 1013 insertions(+), 24 deletions(-)
  create mode 100644 common/flatpak-extra-data-prefetch-private.h
  create mode 100644 common/flatpak-extra-data-prefetch.c
 
@@ -1067,6 +1068,20 @@ index 3e5f725c..969518fc 100644
    'flatpak-exports.c',
    'flatpak-glib-backports.c',
    'flatpak-image-collection.c',
+diff --git a/system-helper/flatpak-system-helper.c b/system-helper/flatpak-system-helper.c
+index 1d29c924..7547c781 100644
+--- a/system-helper/flatpak-system-helper.c
++++ b/system-helper/flatpak-system-helper.c
+@@ -1115,7 +1115,8 @@ handle_configure (FlatpakSystemHelper   *object,
+   if ((strcmp (arg_key, "languages") != 0) &&
+       (strcmp (arg_key, "extra-languages") != 0) &&
+       (strcmp (arg_key, "masked") != 0) &&
+-      (strcmp (arg_key, "pinned") != 0))
++      (strcmp (arg_key, "pinned") != 0) &&
++      (strcmp (arg_key, "extra-data-parallel") != 0))
+     {
+       g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+                                              "Unsupported key: %s", arg_key);
 diff --git a/tests/meson.build b/tests/meson.build
 index 41014150..8df184a8 100644
 --- a/tests/meson.build
@@ -1110,7 +1125,7 @@ index cf317ad6..3181f3bb 100755
 +
  done_testing
 diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
-index 7095a72a..3947db6c 100755
+index 7095a72a..e9bbc6f5 100755
 --- a/tests/test-extra-data.sh
 +++ b/tests/test-extra-data.sh
 @@ -36,7 +36,9 @@ mkdir -p "${EXTRA_DATA_DIR}"
@@ -1134,7 +1149,7 @@ index 7095a72a..3947db6c 100755
  BUILD_FINISH_ARGS=${EXTRA_DATA} make_updated_app ${REPONAME} ${COLLECTION_ID} ${BRANCH} UPDATE1
  
  # ensure it installs correctly
-@@ -55,11 +58,145 @@ install_repo ${REPONAME} ${BRANCH}
+@@ -55,11 +58,149 @@ install_repo ${REPONAME} ${BRANCH}
  # ensure the right extra-data got downloaded
  ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
  assert_file_has_content out "extra-data-test-content"
@@ -1244,24 +1259,28 @@ index 7095a72a..3947db6c 100755
 +rm "${EXTRA_DATA_DIR}/parallel-1.fail"
 +ok "retry failed extra data prefetch"
 +
-+# Interrupting a transaction drops what the prefetcher downloaded.
-+for number in 1 2 3; do
-+    echo 30 > "${EXTRA_DATA_DIR}/parallel-${number}.delay"
-+done
-+rm -rf "${USERDIR}/extra-data"
-+${FLATPAK} ${U} install -y ${REPONAME}-repo \
-+    org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2 &
-+install_pid=$!
-+for _ in $(seq 100); do
-+    test "$(find "${USERDIR}/extra-data" -name .flatpak-prefetch 2>/dev/null | wc -l)" -ge 2 && break
-+    sleep 0.1
-+done
-+kill -INT "${install_pid}"
-+wait "${install_pid}" || true
-+assert_not_has_dir "${USERDIR}/extra-data"
-+for number in 1 2 3; do
-+    echo 0.4 > "${EXTRA_DATA_DIR}/parallel-${number}.delay"
-+done
++# Interrupting a transaction drops what the prefetcher downloaded. The
++# prefetcher runs in the client either way; a system install would leave
++# the system helper's revokefs mount behind until it notices.
++if [ x${USE_SYSTEMDIR-} != xyes ] ; then
++    for number in 1 2 3; do
++        echo 30 > "${EXTRA_DATA_DIR}/parallel-${number}.delay"
++    done
++    rm -rf "${USERDIR}/extra-data"
++    ${FLATPAK} ${U} install -y ${REPONAME}-repo \
++        org.test.ExtraData1 org.test.ExtraData2 org.test.ExtraData3 >&2 &
++    install_pid=$!
++    for _ in $(seq 100); do
++        test "$(find "${USERDIR}/extra-data" -name .flatpak-prefetch 2>/dev/null | wc -l)" -ge 2 && break
++        sleep 0.1
++    done
++    kill -INT "${install_pid}"
++    wait "${install_pid}" || true
++    assert_not_has_dir "${USERDIR}/extra-data"
++    for number in 1 2 3; do
++        echo 0.4 > "${EXTRA_DATA_DIR}/parallel-${number}.delay"
++    done
++fi
 +ok "drop prefetched extra data on interrupt"
 +
 +# A permanent error still comes from the original pull path.

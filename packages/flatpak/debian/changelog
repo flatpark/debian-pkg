@@ -1,3 +1,15 @@
+flatpak (1.18.4-1+flatpark3) unstable; urgency=medium
+
+  * flatpak clean: only remove the empty <id>/<arch>/<branch> directories
+    an interrupted install leaves, never empty directories inside a
+    deployment (extension mount points such as files/lib/GL). 1.18.4-1
+    +flatpark2 removed those, which breaks every app using the runtime;
+    it was never published.
+  * Accept keep-extra-data and extra-data-parallel in the system helper, so
+    `flatpak config --set` works on the system installation.
+
+ -- Komh <mail@guojing.io>  Sat, 24 Oct 2026 19:40:54 +0800
+
 flatpak (1.18.4-1+flatpark2) unstable; urgency=medium
 
   * CLI: every app whose extra-data is downloading shows a spinner and its
