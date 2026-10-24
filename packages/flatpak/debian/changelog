@@ -1,7 +1,8 @@
 flatpak (1.18.4-1+flatpark1) unstable; urgency=medium
 
-  * FlatPark build: download extra-data in parallel, drop the cached
-    extra-data from the repository after deploy, add `flatpak clean`.
+  * FlatPark build: download extra-data in parallel (shown per app in the
+    CLI), drop the cached extra-data from the repository after deploy, add
+    `flatpak clean` (all installations by default).
     Patches live in debian/patches/flatpark/, exported from the
     flatpark/1.18.4 branch of https://github.com/flatpark/flatpak.
   * Drop the flatpak-tests binary package (and its autopkgtests): nobody

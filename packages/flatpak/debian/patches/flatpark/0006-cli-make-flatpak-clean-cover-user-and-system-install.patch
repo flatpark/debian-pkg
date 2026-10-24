@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Komh <mail@guojing.io>
+Date: Sat, 24 Oct 2026 18:25:20 +0800
+Subject: [PATCH] cli: make flatpak clean cover user and system installations
+
+---
+ app/flatpak-builtins-clean.c | 229 ++++++++++++++++++++++++++---------
+ doc/flatpak-clean.xml        |  29 +++--
+ tests/test-extra-data.sh     |  10 ++
+ 3 files changed, 202 insertions(+), 66 deletions(-)
+
+diff --git a/app/flatpak-builtins-clean.c b/app/flatpak-builtins-clean.c
+index 6ceb952f..def60640 100644
+--- a/app/flatpak-builtins-clean.c
++++ b/app/flatpak-builtins-clean.c
+@@ -50,6 +50,7 @@ add_ref_to_commit_map (gpointer key,
+ 
+ static gboolean
+ clean_commit_metadata (OstreeRepo   *repo,
++                       gboolean      dry_run,
+                        GCancellable *cancellable,
+                        guint        *objects,
+                        guint64      *freed_bytes,
+@@ -93,7 +94,7 @@ clean_commit_metadata (OstreeRepo   *repo,
+       gboolean removed;
+       guint64 freed;
+ 
+-      if (!flatpak_repo_remove_extra_data (repo, checksum, opt_dry_run,
++      if (!flatpak_repo_remove_extra_data (repo, checksum, dry_run,
+                                            &removed, &freed, cancellable, error))
+         return FALSE;
+       if (!removed)
+@@ -114,6 +115,7 @@ clean_commit_metadata (OstreeRepo   *repo,
+ 
+ static gboolean
+ clean_extra_data_dir (GFile        *dir,
++                      gboolean      dry_run,
+                       GCancellable *cancellable,
+                       guint        *objects,
+                       guint64      *freed_bytes,
+@@ -137,7 +139,7 @@ clean_extra_data_dir (GFile        *dir,
+         return FALSE;
+ 
+       g_print ("%.1f MB  %s\n", size / (1024.0 * 1024.0), path);
+-      if (!opt_dry_run && !flatpak_rm_rf (dir, cancellable, error))
++      if (!dry_run && !flatpak_rm_rf (dir, cancellable, error))
+         return FALSE;
+       (*objects)++;
+       *freed_bytes += size;
+@@ -181,9 +183,9 @@ clean_extra_data_dir (GFile        *dir,
+       type = g_file_info_get_file_type (info);
+       if (type == G_FILE_TYPE_DIRECTORY)
+         {
+-          if (!clean_extra_data_dir (child, cancellable, objects, freed_bytes, error))
++          if (!clean_extra_data_dir (child, dry_run, cancellable, objects, freed_bytes, error))
+             return FALSE;
+-          if (!opt_dry_run && !g_file_delete (child, cancellable, &local_error) &&
++          if (!dry_run && !g_file_delete (child, cancellable, &local_error) &&
+               !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY) &&
+               !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
+             {
+@@ -198,7 +200,7 @@ clean_extra_data_dir (GFile        *dir,
+           guint64 size = g_file_info_get_size (info);
+ 
+           g_print ("%.1f MB  %s\n", size / (1024.0 * 1024.0), path);
+-          if (!opt_dry_run && !g_file_delete (child, cancellable, error))
++          if (!dry_run && !g_file_delete (child, cancellable, error))
+             return FALSE;
+           (*objects)++;
+           *freed_bytes += size;
+@@ -213,88 +215,198 @@ clean_extra_data_dir (GFile        *dir,
+   return TRUE;
+ }
+ 
+-gboolean
+-flatpak_builtin_clean (int argc, char **argv, GCancellable *cancellable, GError **error)
++static gboolean
++has_explicit_installation_selection (int    argc,
++                               char **argv)
++{
++  for (int i = 1; i < argc; i++)
++    {
++      if (strcmp (argv[i], "--user") == 0 ||
++          strcmp (argv[i], "-u") == 0 ||
++          strcmp (argv[i], "--system") == 0 ||
++          strcmp (argv[i], "--installation") == 0 ||
++          g_str_has_prefix (argv[i], "--installation="))
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
++static char *
++get_installation_title (FlatpakDir *dir)
++{
++  if (flatpak_dir_is_user (dir))
++    return g_strdup (_("User installation"));
++  if (g_strcmp0 (flatpak_dir_get_id (dir), SYSTEM_DIR_DEFAULT_ID) == 0)
++    return g_strdup (_("System installation (default)"));
++  return g_strdup_printf (_("Installation %s"), flatpak_dir_get_name_cached (dir));
++}
++
++static gboolean
++clean_repo (FlatpakDir    *dir,
++            gboolean       explicit_selection,
++            GCancellable  *cancellable,
++            gboolean      *out_read_only,
++            guint         *out_objects,
++            guint64       *out_freed_bytes,
++            GError       **error)
+ {
+-  g_autoptr(GOptionContext) context = NULL;
+-  g_autoptr(GPtrArray) dirs = NULL;
+   g_autoptr(GCancellable) lock_cancellable = NULL;
+   g_autoptr(GError) lock_error = NULL;
+   g_autoptr(OstreeRepoAutoLock) repo_lock = NULL;
+-  g_autoptr(GFile) extra_data_dir = NULL;
+   g_autofree char *repo_path = NULL;
+-  FlatpakDir *dir;
+-  OstreeRepo *repo;
+-  guint objects = 0;
+-  guint64 freed_bytes = 0;
++  OstreeRepo *repo = flatpak_dir_get_repo (dir);
++  gboolean writable;
++  gboolean dry_run;
+   GThread *lock_timeout_thread;
+ 
+-  context = g_option_context_new (_("- Remove cached extra-data from the local repository"));
+-  g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);
++  *out_read_only = FALSE;
++  *out_objects = 0;
++  *out_freed_bytes = 0;
+ 
+-  if (!flatpak_option_context_parse (context, options, &argc, &argv,
+-                                     FLATPAK_BUILTIN_FLAG_ONE_DIR,
+-                                     &dirs, cancellable, error))
+-    return FALSE;
+-  if (argc != 1)
+-    return usage_error (context, _("Too many arguments"), error);
++  if (repo == NULL)
++    return TRUE;
+ 
+-  dir = g_ptr_array_index (dirs, 0);
+   flatpak_dir_set_no_system_helper (dir, TRUE);
+-  if (!flatpak_dir_ensure_repo (dir, cancellable, error))
+-    return FALSE;
+-
+-  repo = flatpak_dir_get_repo (dir);
+   repo_path = g_file_get_path (ostree_repo_get_path (repo));
+-  if (access (repo_path, W_OK) != 0)
++  writable = access (repo_path, W_OK) == 0;
++  if (!writable && explicit_selection)
+     return flatpak_fail (error,
+                          _("The repository at %s is not writable; run this command as root"),
+                          repo_path);
+ 
+-  lock_cancellable = g_cancellable_new ();
+-  lock_timeout_thread = g_thread_new ("clean-lock-timeout", cancel_lock_wait,
+-                                      lock_cancellable);
+-  repo_lock = ostree_repo_auto_lock_push (repo, OSTREE_REPO_LOCK_EXCLUSIVE,
+-                                          lock_cancellable, &lock_error);
+-  g_thread_join (lock_timeout_thread);
+-  if (repo_lock == NULL)
++  dry_run = opt_dry_run || !writable;
++  *out_read_only = !writable;
++
++  if (writable)
+     {
+-      if (g_cancellable_set_error_if_cancelled (cancellable, error))
+-        return FALSE;
+-      if (g_error_matches (lock_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+-        return flatpak_fail (error, _("The repository is busy with another transaction"));
+-      g_propagate_error (error, g_steal_pointer (&lock_error));
+-      g_prefix_error (error, _("Unable to acquire exclusive repository lock: "));
+-      return FALSE;
++      lock_cancellable = g_cancellable_new ();
++      lock_timeout_thread = g_thread_new ("clean-lock-timeout", cancel_lock_wait,
++                                          lock_cancellable);
++      repo_lock = ostree_repo_auto_lock_push (repo, OSTREE_REPO_LOCK_EXCLUSIVE,
++                                              lock_cancellable, &lock_error);
++      g_thread_join (lock_timeout_thread);
++      if (repo_lock == NULL)
++        {
++          if (g_cancellable_set_error_if_cancelled (cancellable, error))
++            return FALSE;
++          if (g_error_matches (lock_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++            return flatpak_fail (error, _("The repository is busy with another transaction"));
++          g_propagate_error (error, g_steal_pointer (&lock_error));
++          g_prefix_error (error, _("Unable to acquire exclusive repository lock: "));
++          return FALSE;
++        }
+     }
+ 
+-  if (!clean_commit_metadata (repo, cancellable, &objects, &freed_bytes, error))
+-    return FALSE;
++  return clean_commit_metadata (repo, dry_run, cancellable,
++                                out_objects, out_freed_bytes, error);
++}
+ 
+-  extra_data_dir = flatpak_build_file (flatpak_get_user_base_dir_location (),
+-                                       "extra-data", NULL);
+-  if (!clean_extra_data_dir (extra_data_dir, cancellable,
+-                             &objects, &freed_bytes, error))
++gboolean
++flatpak_builtin_clean (int argc, char **argv, GCancellable *cancellable, GError **error)
++{
++  g_autoptr(GOptionContext) context = NULL;
++  g_autoptr(GPtrArray) dirs = NULL;
++  g_autoptr(GFile) extra_data_dir = NULL;
++  gboolean explicit_selection = has_explicit_installation_selection (argc, argv);
++  gboolean show_titles;
++  guint total_objects = 0;
++  guint64 total_freed_bytes = 0;
++
++  context = g_option_context_new (_("- Remove cached extra-data from local repositories"));
++  g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);
++
++  if (!flatpak_option_context_parse (context, options, &argc, &argv,
++                                     FLATPAK_BUILTIN_FLAG_ALL_DIRS |
++                                     FLATPAK_BUILTIN_FLAG_OPTIONAL_REPO,
++                                     &dirs, cancellable, error))
+     return FALSE;
+-  if (!opt_dry_run)
++  if (argc != 1)
++    return usage_error (context, _("Too many arguments"), error);
++
++  show_titles = dirs->len > 1;
++  for (guint i = 0; i < dirs->len; i++)
+     {
+-      g_autoptr(GError) local_error = NULL;
++      FlatpakDir *dir = g_ptr_array_index (dirs, i);
++      gboolean is_user = flatpak_dir_is_user (dir);
++      gboolean have_repo = flatpak_dir_get_repo (dir) != NULL;
++      gboolean have_extra_data = FALSE;
++      gboolean read_only = FALSE;
++      guint objects = 0;
++      guint64 freed_bytes = 0;
++
++      if (is_user)
++        {
++          extra_data_dir = flatpak_build_file (flatpak_get_user_base_dir_location (),
++                                               "extra-data", NULL);
++          have_extra_data = g_file_query_exists (extra_data_dir, cancellable);
++        }
++      if (!have_repo && !is_user)
++        continue;
+ 
+-      if (!g_file_delete (extra_data_dir, cancellable, &local_error) &&
+-          !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY) &&
+-          !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++      if (show_titles && (have_repo || have_extra_data))
+         {
+-          g_propagate_error (error, g_steal_pointer (&local_error));
+-          return FALSE;
++          g_autofree char *title = get_installation_title (dir);
++          g_print ("%s:\n", title);
++        }
++
++      if (have_repo &&
++          !clean_repo (dir, explicit_selection, cancellable,
++                       &read_only, &objects, &freed_bytes, error))
++        return FALSE;
++
++      if (read_only)
++        {
++          g_autofree char *title = get_installation_title (dir);
++          g_autofree char *formatted = g_format_size (freed_bytes);
++
++          if (is_user)
++            g_print (_("%s: would free %s; the repository is not writable\n"),
++                     title, formatted);
++          else if (g_strcmp0 (flatpak_dir_get_id (dir), SYSTEM_DIR_DEFAULT_ID) == 0)
++            g_print (_("%s: would free %s; run \"sudo flatpak clean --system\"\n"),
++                     title, formatted);
++          else
++            g_print (_("%s: would free %s; run \"sudo flatpak clean --installation=%s\"\n"),
++                     title, formatted, flatpak_dir_get_id (dir));
++        }
++
++      if (opt_dry_run || !read_only)
++        {
++          total_objects += objects;
++          total_freed_bytes += freed_bytes;
++        }
++
++      if (is_user)
++        {
++          objects = 0;
++          freed_bytes = 0;
++          if (!clean_extra_data_dir (extra_data_dir, opt_dry_run, cancellable,
++                                     &objects, &freed_bytes, error))
++            return FALSE;
++          if (!opt_dry_run)
++            {
++              g_autoptr(GError) local_error = NULL;
++
++              if (!g_file_delete (extra_data_dir, cancellable, &local_error) &&
++                  !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY) &&
++                  !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++                {
++                  g_propagate_error (error, g_steal_pointer (&local_error));
++                  return FALSE;
++                }
++            }
++          total_objects += objects;
++          total_freed_bytes += freed_bytes;
+         }
+     }
+ 
+   if (opt_dry_run)
+     g_print (_("Would free: %u objects, %.2f GB\n"),
+-             objects, freed_bytes / (1024.0 * 1024.0 * 1024.0));
++             total_objects, total_freed_bytes / (1024.0 * 1024.0 * 1024.0));
+   else
+     g_print (_("Freed: %u objects, %.2f GB\n"),
+-             objects, freed_bytes / (1024.0 * 1024.0 * 1024.0));
++             total_objects, total_freed_bytes / (1024.0 * 1024.0 * 1024.0));
+ 
+   return TRUE;
+ }
+@@ -307,7 +419,8 @@ flatpak_complete_clean (FlatpakCompletion *completion)
+   context = g_option_context_new ("");
+   if (!flatpak_option_context_parse (context, options,
+                                      &completion->argc, &completion->argv,
+-                                     FLATPAK_BUILTIN_FLAG_ONE_DIR,
++                                     FLATPAK_BUILTIN_FLAG_ALL_DIRS |
++                                     FLATPAK_BUILTIN_FLAG_OPTIONAL_REPO,
+                                      NULL, NULL, NULL))
+     return FALSE;
+ 
+diff --git a/doc/flatpak-clean.xml b/doc/flatpak-clean.xml
+index 375788aa..408603ed 100644
+--- a/doc/flatpak-clean.xml
++++ b/doc/flatpak-clean.xml
+@@ -28,15 +28,25 @@
+     <refsect1>
+         <title>Description</title>
+         <para>
+-            Removes embedded extra-data from commits in a local Flatpak repository.
+-            It also removes incomplete <filename>.part</filename> downloads from the
+-            per-user extra-data directory. Other files in that directory are reported
+-            and left unchanged.
++            Removes embedded extra-data from commits in local Flatpak repositories.
++            By default, all configured user and system installations are inspected.
++            Writable installations are cleaned, while system installations that are
++            not writable are reported without modification. Use <option>--user</option>,
++            <option>--system</option>, or <option>--installation</option> to limit the
++            command to selected installations.
+         </para>
+         <para>
+-            The repository is locked exclusively while it is inspected and modified.
+-            Cleaning a system installation requires direct write access to its repository
+-            and does not use the Flatpak system helper.
++            It also removes incomplete <filename>.part</filename> downloads and
++            interrupted prefetch directories from the per-user extra-data directory.
++            Other files in that directory are reported and left unchanged. The
++            per-user directory is not inspected when only system installations are
++            selected.
++        </para>
++        <para>
++            Writable repositories are locked exclusively while they are inspected and
++            modified. Cleaning an explicitly selected system installation requires
++            direct write access to its repository and does not use the Flatpak system
++            helper.
+         </para>
+     </refsect1>
+ 
+@@ -51,7 +61,10 @@
+             <varlistentry>
+                 <term><option>-u</option></term>
+                 <term><option>--user</option></term>
+-                <listitem><para>Clean the per-user installation.</para></listitem>
++                <listitem><para>
++                    Clean the per-user installation. This also cleans the per-user
++                    extra-data download directory.
++                </para></listitem>
+             </varlistentry>
+             <varlistentry>
+                 <term><option>--system</option></term>
+diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
+index cd1c7da5..61020c86 100755
+--- a/tests/test-extra-data.sh
++++ b/tests/test-extra-data.sh
+@@ -76,6 +76,16 @@ assert_file_has_content detached-keys "^xa.extra-data$"
+ assert_file_has_content detached-keys "^ostree.gpgsigs$"
+ ok "keep extra data in detached metadata when configured"
+ 
++${FLATPAK} clean --dry-run > clean-all-dry-run-out
++assert_file_has_content clean-all-dry-run-out "Would free:"
++assert_file_has_content clean-all-dry-run-out "org.test.Hello"
++if test -n "${U}"; then
++    assert_file_has_content clean-all-dry-run-out "User installation:"
++else
++    assert_file_has_content clean-all-dry-run-out "System installation (default):"
++fi
++ok "clean defaults to all installations"
++
+ mkdir -p "${USERDIR}/extra-data/cleanup"
+ printf partial > "${USERDIR}/extra-data/cleanup/orphan.part"
+ printf keep > "${USERDIR}/extra-data/cleanup/keep.txt"
