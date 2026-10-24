@@ -1,8 +1,12 @@
 # flatpak
 
-Debian sid's `flatpak` with FlatPark's patches on top: a drop-in replacement for
-`flatpak`, `libflatpak0` and the rest of the source package, so GNOME Software
-and Discover pick up the changes too.
+Debian sid's `flatpak` with FlatPark's patches on top, as a drop-in
+replacement for `flatpak` and `libflatpak0`. The CLI, system helper and portal
+do not link libflatpak, so the `flatpak` package alone carries every change;
+`libflatpak0` brings the parallel downloads and the dropped cache to GNOME
+Software, Discover and other libflatpak frontends, and is only installed when
+one of them needs it. The development packages (`libflatpak-dev`,
+`gir1.2-flatpak-1.0`, `libflatpak-doc`) are not built.
 
 | Change | Effect |
 | --- | --- |
@@ -16,24 +20,9 @@ detached metadata", and a normal reinstall fixes it.
 
 ## Installing
 
-From apt.flatpark.org, an `apt upgrade` replaces Debian's packages with these
-(the `+flatpark` version sorts above sid's), only for the ones already
-installed; a fresh install is `sudo apt install flatpak`.
-
-The build produces Debian's usual split: `flatpak` (the CLI, system helper and
-portal), `libflatpak0` (for GNOME Software / Discover), and the development
-packages `libflatpak-dev`, `gir1.2-flatpak-1.0`, `libflatpak-doc`. When
-installing a local build, install only what is already there, normally just
-the CLI:
-
-```sh
-sudo apt install ./out/flatpak/flatpak_*.deb
-```
-
-Never `dpkg -i out/flatpak/*.deb`: dpkg does not resolve dependencies, so the
-development packages are left unconfigured and apt refuses to work until they
-are removed. The `flatpak` binary links the patched code statically, so the
-CLI alone carries every change.
+From apt.flatpark.org, `sudo apt install flatpak` (or `apt upgrade` when it is
+already installed: the `+flatpark` version sorts above sid's). A local build
+is `sudo apt install ./out/flatpak/flatpak_*.deb`.
 
 ## Where the code lives
 
@@ -56,9 +45,12 @@ When sid moves to `<new>-N`:
 
 1. Replace `debian/` with Debian's packaging for `<new>-N` (from
    `https://deb.debian.org/debian/pool/main/f/flatpak/flatpak_<new>-N.debian.tar.xz`),
-   keeping `debian/patches/flatpark/`. Drop the `flatpak-tests` binary
-   package again: its stanza in `debian/control`, `flatpak-tests.*`, and the
-   autopkgtests in `debian/tests/` that depend on it.
+   keeping `debian/patches/flatpark/` and `debian/not-installed`. Drop every
+   binary package but `flatpak` and `libflatpak0` again: the other stanzas
+   and `Build-Depends-Indep` in `debian/control`, their `debian/<package>.*`
+   files, and the autopkgtests in `debian/tests/`. Keep two packages: with
+   one, debhelper installs into `debian/flatpak/` instead of `debian/tmp/`,
+   which `debian/rules` relies on.
 2. In the fork: `git switch -c flatpark/<new> <new>` and cherry-pick the
    commits from the previous `flatpark/<old>` branch.
 3. Prepend a `<new>-N+flatpark1` changelog entry, re-pin `meta.json`, run
@@ -69,7 +61,7 @@ it, pin it on the machine:
 
 ```
 # /etc/apt/preferences.d/flatpak-flatpark
-Package: flatpak libflatpak0 libflatpak-dev gir1.2-flatpak-1.0 flatpak-tests libflatpak-doc
+Package: flatpak libflatpak0
 Pin: version *+flatpark*
 Pin-Priority: 1001
 ```

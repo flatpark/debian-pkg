@@ -1,7 +1,0 @@
-Tests:
- build,
-Restrictions:
- superficial,
-Depends:
- build-essential,
- libflatpak-dev,

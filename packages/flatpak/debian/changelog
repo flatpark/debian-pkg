@@ -1,3 +1,11 @@
+flatpak (1.18.4-1+flatpark4) unstable; urgency=medium
+
+  * Build only flatpak and libflatpak0: libflatpak-dev, gir1.2-flatpak-1.0
+    and libflatpak-doc only replaced Debian's development packages for no
+    benefit. Their autopkgtest goes too.
+
+ -- Komh <mail@guojing.io>  Sat, 24 Oct 2026 19:47:23 +0800
+
 flatpak (1.18.4-1+flatpark3) unstable; urgency=medium
 
   * flatpak clean: only remove the empty <id>/<arch>/<branch> directories
