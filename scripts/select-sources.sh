@@ -17,14 +17,6 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
-# One field of packages/<src>/meta.json (see README), empty when the file or
-# field is missing.
-meta_get() {  # meta_get <source> <jq path>
-    local meta; meta="$(pkg_dir "$1")/meta.json"
-    [ -f "$meta" ] || return 0
-    jq -r "$2 | select(. != null)" "$meta"
-}
-
 case "${1:-}" in
 changed)
     files="$(git -C "$ROOT" diff --name-only "$2" "$3")"

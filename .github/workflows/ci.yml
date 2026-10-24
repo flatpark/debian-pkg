@@ -1,7 +1,7 @@
 name: ci
 
-# Pull requests: build every package the PR touches (all of them when the
-# shared build scripts change).
+# Pull requests: build every package the PR touches, plus those a changed
+# shared build script takes part in (see scripts/select-sources.sh).
 
 on:
   pull_request:
