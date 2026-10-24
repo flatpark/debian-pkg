@@ -4,6 +4,8 @@ name: update-check
 # release, build it, and open (or refresh) a PR from auto/update-<source>.
 # Packages with "automerge": true in meta.json are merged once the build
 # passes, and release.yml is dispatched; the rest wait for review.
+# Packages with "update": "issue" (local patches that need a manual rebase)
+# are neither bumped nor built: a newer version opens an issue instead.
 
 on:
   schedule:
@@ -14,19 +16,52 @@ permissions:
   contents: write
   pull-requests: write
   actions: write
+  issues: write
 
 jobs:
   select:
     runs-on: ubuntu-latest
     outputs:
       sources: ${{ steps.s.outputs.sources }}
+      notify: ${{ steps.s.outputs.notify }}
     steps:
       - uses: actions/checkout@v7
       - id: s
-        run: echo "sources=$(scripts/select-sources.sh updatable)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sources=$(scripts/select-sources.sh updatable)" >> "$GITHUB_OUTPUT"
+          echo "notify=$(scripts/select-sources.sh notify)" >> "$GITHUB_OUTPUT"
+
+  notify:
+    needs: select
+    if: needs.select.outputs.notify != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.select.outputs.notify) }}
+    runs-on: ubuntu-latest
+    env:
+      SRC: ${{ matrix.source }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Open issue for a newer version
+        run: |
+          set -eu
+          v="$(scripts/notify-update.sh "$SRC")"
+          [ -n "$v" ] || exit 0
+          title="$SRC: $v available"
+          if gh issue list --state open --search "in:title \"$title\"" --json title -q '.[].title' | grep -Fxq "$title"; then
+            echo "already reported: $title"
+            exit 0
+          fi
+          gh issue create --title "$title" --body "$(printf '%s\n\n%s\n' \
+            "update-check found \`$v\` for \`$SRC\`; the package carries local patches, so it is not bumped automatically." \
+            "See [packages/$SRC/README.md]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/main/packages/$SRC/README.md) for the update steps.")"
 
   update:
     needs: select
+    if: needs.select.outputs.sources != '[]'
     strategy:
       fail-fast: false
       matrix:

@@ -64,7 +64,10 @@ packages/<source>/
 - **Updates.** `update-check.yml` runs each resolver daily. A newer upstream
   version gets a changelog entry and a re-pin, is built and tested, and lands
   as a PR from `auto/update-<source>`. Packages with `"automerge": true` are
-  merged and released right away; the rest wait for review.
+  merged and released right away; the rest wait for review. Packages with
+  `"update": "issue"` carry local patches that need a manual rebase: they are
+  not bumped, a newer version opens an issue instead. `"publish": false`
+  keeps a package out of the release and the apt repository.
 - **CI.** Pull requests build every package they touch (all packages when
   `build.sh` or `scripts/` change).
 

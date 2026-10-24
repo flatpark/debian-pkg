@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Komh <mail@guojing.io>
+Date: Sat, 24 Oct 2026 16:28:13 +0800
+Subject: [PATCH] deploy: discard embedded extra data after use
+
+---
+ app/flatpak-builtins-config.c       |  7 +++
+ common/flatpak-dir.c                | 15 ++++++
+ common/flatpak-extra-data-private.c | 72 +++++++++++++++++++++++++++++
+ common/flatpak-extra-data-private.h | 18 ++++++++
+ common/meson.build                  |  1 +
+ tests/test-config.sh                |  1 +
+ tests/test-extra-data.sh            | 14 ++++++
+ 7 files changed, 128 insertions(+)
+ create mode 100644 common/flatpak-extra-data-private.c
+ create mode 100644 common/flatpak-extra-data-private.h
+
+diff --git a/app/flatpak-builtins-config.c b/app/flatpak-builtins-config.c
+index 5152de17..4a4cfe2e 100644
+--- a/app/flatpak-builtins-config.c
++++ b/app/flatpak-builtins-config.c
+@@ -258,6 +258,12 @@ get_report_os_info_default (FlatpakDir *dir)
+   return g_strdup ("true");
+ }
+ 
++static char *
++get_keep_extra_data_default (FlatpakDir *dir)
++{
++  return g_strdup ("false");
++}
++
+ static char *
+ get_extra_data_parallel_default (FlatpakDir *dir)
+ {
+@@ -276,6 +282,7 @@ ConfigKey keys[] = {
+   { "languages", parse_lang, print_lang, get_lang_default },
+   { "extra-languages", parse_locale, print_locale, NULL },
+   { "report-os-info", parse_boolean, print_boolean, get_report_os_info_default },
++  { "keep-extra-data", parse_boolean, print_boolean, get_keep_extra_data_default },
+   { "extra-data-parallel", parse_non_negative_integer, print_value, get_extra_data_parallel_default },
+ };
+ 
+diff --git a/common/flatpak-dir.c b/common/flatpak-dir.c
+index cdc6e5c0..6ad7191f 100644
+--- a/common/flatpak-dir.c
++++ b/common/flatpak-dir.c
+@@ -51,6 +51,7 @@
+ #include "flatpak-dir-private.h"
+ #include "flatpak-dir-utils-private.h"
+ #include "flatpak-error.h"
++#include "flatpak-extra-data-private.h"
+ #include "flatpak-extra-data-prefetch-private.h"
+ #include "flatpak-locale-utils-private.h"
+ #include "flatpak-image-collection-private.h"
+@@ -10523,6 +10524,20 @@ flatpak_dir_deploy (FlatpakDir          *self,
+   if (!flatpak_dir_update_deploy_ref (self, flatpak_decomposed_get_ref (ref), checksum, error))
+     return FALSE;
+ 
++  {
++    g_autofree char *keep_extra_data = flatpak_dir_get_config (self, "keep-extra-data", NULL);
++
++    if (g_strcmp0 (keep_extra_data, "true") != 0)
++      {
++        g_autoptr(GError) local_error = NULL;
++
++        if (!flatpak_repo_remove_extra_data (self->repo, checksum, NULL, NULL,
++                                             cancellable, &local_error))
++          g_warning ("Unable to remove extra data from commit %s: %s",
++                     checksum, local_error->message);
++      }
++  }
++
+   return TRUE;
+ }
+ 
+diff --git a/common/flatpak-extra-data-private.c b/common/flatpak-extra-data-private.c
+new file mode 100644
+index 00000000..580d52d2
+--- /dev/null
++++ b/common/flatpak-extra-data-private.c
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2025 FlatPark contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#include "config.h"
++
++#include "flatpak-extra-data-private.h"
++#include "flatpak-utils-private.h"
++
++static guint64
++get_commitmeta_size (OstreeRepo *repo,
++                     const char *checksum)
++{
++  g_autoptr(GFile) file = NULL;
++  g_autoptr(GFileInfo) info = NULL;
++  g_autofree char *relative_path = NULL;
++
++  relative_path = g_strdup_printf ("objects/%c%c/%s.commitmeta",
++                                   checksum[0], checksum[1], checksum + 2);
++  file = g_file_resolve_relative_path (ostree_repo_get_path (repo), relative_path);
++  info = g_file_query_info (file, G_FILE_ATTRIBUTE_STANDARD_SIZE,
++                            G_FILE_QUERY_INFO_NONE, NULL, NULL);
++  return info != NULL ? g_file_info_get_size (info) : 0;
++}
++
++gboolean
++flatpak_repo_remove_extra_data (OstreeRepo   *repo,
++                                const char   *checksum,
++                                gboolean     *out_removed,
++                                guint64      *out_freed_bytes,
++                                GCancellable *cancellable,
++                                GError      **error)
++{
++  g_autoptr(GVariant) metadata = NULL;
++  g_autoptr(GVariant) extra_data = NULL;
++  g_autoptr(GVariant) new_metadata = NULL;
++  g_auto(GVariantDict) metadata_dict = FLATPAK_VARIANT_DICT_INITIALIZER;
++  guint64 old_size;
++  guint64 new_size;
++
++  if (out_removed != NULL)
++    *out_removed = FALSE;
++  if (out_freed_bytes != NULL)
++    *out_freed_bytes = 0;
++
++  if (!ostree_validate_checksum_string (checksum, error))
++    return FALSE;
++  if (!ostree_repo_read_commit_detached_metadata (repo, checksum, &metadata,
++                                                  cancellable, error))
++    return FALSE;
++  extra_data = metadata != NULL ?
++               g_variant_lookup_value (metadata, "xa.extra-data", NULL) : NULL;
++  if (extra_data == NULL)
++    return TRUE;
++
++  old_size = get_commitmeta_size (repo, checksum);
++  g_variant_dict_init (&metadata_dict, metadata);
++  g_variant_dict_remove (&metadata_dict, "xa.extra-data");
++  new_metadata = g_variant_ref_sink (g_variant_dict_end (&metadata_dict));
++
++  if (!ostree_repo_write_commit_detached_metadata (repo, checksum, new_metadata,
++                                                   cancellable, error))
++    return FALSE;
++
++  new_size = get_commitmeta_size (repo, checksum);
++  if (out_removed != NULL)
++    *out_removed = TRUE;
++  if (out_freed_bytes != NULL && old_size > new_size)
++    *out_freed_bytes = old_size - new_size;
++  return TRUE;
++}
+diff --git a/common/flatpak-extra-data-private.h b/common/flatpak-extra-data-private.h
+new file mode 100644
+index 00000000..24c15518
+--- /dev/null
++++ b/common/flatpak-extra-data-private.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright 2025 FlatPark contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#ifndef __FLATPAK_EXTRA_DATA_PRIVATE_H__
++#define __FLATPAK_EXTRA_DATA_PRIVATE_H__
++
++#include <ostree.h>
++
++gboolean flatpak_repo_remove_extra_data (OstreeRepo   *repo,
++                                         const char   *checksum,
++                                         gboolean     *out_removed,
++                                         guint64      *out_freed_bytes,
++                                         GCancellable *cancellable,
++                                         GError      **error);
++
++#endif /* __FLATPAK_EXTRA_DATA_PRIVATE_H__ */
+diff --git a/common/meson.build b/common/meson.build
+index 969518fc..90b55416 100644
+--- a/common/meson.build
++++ b/common/meson.build
+@@ -187,6 +187,7 @@ sources = [
+   'flatpak-dir-utils.c',
+   'flatpak-docker-reference.c',
+   'flatpak-error.c',
++  'flatpak-extra-data-private.c',
+   'flatpak-extra-data-prefetch.c',
+   'flatpak-exports.c',
+   'flatpak-glib-backports.c',
+diff --git a/tests/test-config.sh b/tests/test-config.sh
+index 3181f3bb..170d5253 100755
+--- a/tests/test-config.sh
++++ b/tests/test-config.sh
+@@ -27,6 +27,7 @@ export LC_ALL=C
+ ${FLATPAK} config --list > list_out
+ assert_file_has_content list_out "^languages:"
+ assert_file_has_content list_out "^extra-data-parallel: [*]unset[*] [(]default: 4[)]"
++assert_file_has_content list_out "^keep-extra-data: [*]unset[*] [(]default: false[)]"
+ 
+ ok "config list"
+ 
+diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
+index 6791db4a..591eb730 100755
+--- a/tests/test-extra-data.sh
++++ b/tests/test-extra-data.sh
+@@ -59,10 +59,24 @@ ${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
+ assert_file_has_content out "extra-data-test-content"
+ assert_not_has_file "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
+ 
++EXTRA_DATA_COMMIT=$(${FLATPAK} ${U} info --show-commit org.test.Hello)
++ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
++assert_not_file_has_content detached-keys "^xa.extra-data$"
++assert_file_has_content detached-keys "^ostree.gpgsigs$"
++
+ ${FLATPAK} ${U} uninstall -y org.test.Hello >&2
+ 
+ ok "install extra data app with ostree"
+ 
++${FLATPAK} ${U} config --set keep-extra-data true
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
++ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
++assert_file_has_content detached-keys "^xa.extra-data$"
++assert_file_has_content detached-keys "^ostree.gpgsigs$"
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
++${FLATPAK} ${U} config --unset keep-extra-data
++ok "keep extra data in detached metadata when configured"
++
+ # A file supplied by the user must never be removed by the prefetcher.
+ mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
+ cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"

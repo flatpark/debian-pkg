@@ -7,7 +7,12 @@
 #   fetch.sh            turns that version into a ready-to-build tree
 #                       (see scripts/build-in-container.sh for the contract)
 #   resolve-update.sh   optional; prints the newest upstream release as JSON
-#   meta.json           optional; upstream pin + update policy
+#   meta.json           optional; upstream pin + policy:
+#                         "automerge": true   merge update PRs once built
+#                         "update": "issue"   updates open an issue instead of
+#                                             a PR (patched packages that need
+#                                             a manual rebase)
+#                         "publish": false    never release to the apt repo
 #
 # Every built version becomes one GitHub Release tagged <source>_<version>.
 
@@ -65,6 +70,14 @@ safe_name() {  # safe_name <file name>
 
 maintainer() {  # maintainer <source>
     sed -n 's/^Maintainer: *//p' "$(pkg_dir "$1")/debian/control" | head -n1
+}
+
+# One field of packages/<src>/meta.json, empty when the file or field is
+# missing.
+meta_get() {  # meta_get <source> <jq path>
+    local meta; meta="$(pkg_dir "$1")/meta.json"
+    [ -f "$meta" ] || return 0
+    jq -r "$2 | select(. != null)" "$meta"
 }
 
 # Copy packages/<src>/debian into a fetched source tree.

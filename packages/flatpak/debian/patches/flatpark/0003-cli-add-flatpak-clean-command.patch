@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Komh <mail@guojing.io>
+Date: Sat, 24 Oct 2026 16:37:32 +0800
+Subject: [PATCH] cli: add flatpak clean command
+
+---
+ app/flatpak-builtins-clean.c        | 288 ++++++++++++++++++++++++++++
+ app/flatpak-builtins.h              |   1 +
+ app/flatpak-main.c                  |   1 +
+ app/meson.build                     |   1 +
+ common/flatpak-dir.c                |   2 +-
+ common/flatpak-extra-data-private.c |   7 +-
+ common/flatpak-extra-data-private.h |   1 +
+ doc/flatpak-clean.xml               |  96 ++++++++++
+ doc/flatpak.xml                     |   7 +
+ doc/meson.build                     |   1 +
+ tests/test-extra-data.sh            |  51 ++++-
+ 11 files changed, 451 insertions(+), 5 deletions(-)
+ create mode 100644 app/flatpak-builtins-clean.c
+ create mode 100644 doc/flatpak-clean.xml
+
+diff --git a/app/flatpak-builtins-clean.c b/app/flatpak-builtins-clean.c
+new file mode 100644
+index 00000000..509d6424
+--- /dev/null
++++ b/app/flatpak-builtins-clean.c
+@@ -0,0 +1,288 @@
++/* vi:set et sw=2 sts=2 cin cino=t0,f0,(0,{s,>2s,n-s,^-s,e-s:
++ * Copyright 2025 FlatPark contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#include "config.h"
++
++#include <unistd.h>
++
++#include <glib/gi18n.h>
++
++#include "flatpak-builtins.h"
++#include "flatpak-extra-data-private.h"
++#include "flatpak-utils-private.h"
++
++static gboolean opt_dry_run;
++
++static GOptionEntry options[] = {
++  { "dry-run", 0, 0, G_OPTION_ARG_NONE, &opt_dry_run, N_("Don't make any changes"), NULL },
++  { NULL }
++};
++
++static gpointer
++cancel_lock_wait (gpointer data)
++{
++  GCancellable *cancellable = data;
++
++  g_usleep (100 * G_TIME_SPAN_MILLISECOND);
++  g_cancellable_cancel (cancellable);
++  return NULL;
++}
++
++static void
++add_ref_to_commit_map (gpointer key,
++                       gpointer value,
++                       gpointer user_data)
++{
++  const char *ref = key;
++  const char *checksum = value;
++  GHashTable *commit_refs = user_data;
++  const char *old_ref = g_hash_table_lookup (commit_refs, checksum);
++
++  if (old_ref == NULL ||
++      ((!g_str_has_prefix (old_ref, "app/") && !g_str_has_prefix (old_ref, "runtime/")) &&
++       (g_str_has_prefix (ref, "app/") || g_str_has_prefix (ref, "runtime/"))))
++    g_hash_table_replace (commit_refs, g_strdup (checksum), g_strdup (ref));
++}
++
++static gboolean
++clean_commit_metadata (OstreeRepo   *repo,
++                       GCancellable *cancellable,
++                       guint        *objects,
++                       guint64      *freed_bytes,
++                       GError      **error)
++{
++  g_autoptr(GHashTable) repo_objects = NULL;
++  g_autoptr(GHashTable) refs = NULL;
++  g_autoptr(GHashTable) commit_refs = NULL;
++  g_autoptr(GPtrArray) commits = NULL;
++  GHashTableIter iter;
++  gpointer key;
++
++  if (!ostree_repo_list_objects (repo,
++                                 OSTREE_REPO_LIST_OBJECTS_ALL |
++                                 OSTREE_REPO_LIST_OBJECTS_NO_PARENTS,
++                                 &repo_objects, cancellable, error) ||
++      !ostree_repo_list_refs (repo, NULL, &refs, cancellable, error))
++    return FALSE;
++
++  commit_refs = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
++  g_hash_table_foreach (refs, add_ref_to_commit_map, commit_refs);
++  commits = g_ptr_array_new_with_free_func (g_free);
++
++  g_hash_table_iter_init (&iter, repo_objects);
++  while (g_hash_table_iter_next (&iter, &key, NULL))
++    {
++      const char *checksum;
++      OstreeObjectType object_type;
++
++      ostree_object_name_deserialize (key, &checksum, &object_type);
++      if (object_type == OSTREE_OBJECT_TYPE_COMMIT)
++        g_ptr_array_add (commits, g_strdup (checksum));
++    }
++  g_ptr_array_sort (commits, flatpak_strcmp0_ptr);
++
++  for (guint i = 0; i < commits->len; i++)
++    {
++      const char *checksum = g_ptr_array_index (commits, i);
++      const char *ref = g_hash_table_lookup (commit_refs, checksum);
++      g_autofree char *short_checksum = NULL;
++      gboolean removed;
++      guint64 freed;
++
++      if (!flatpak_repo_remove_extra_data (repo, checksum, opt_dry_run,
++                                           &removed, &freed, cancellable, error))
++        return FALSE;
++      if (!removed)
++        continue;
++
++      if (ref == NULL)
++        {
++          short_checksum = g_strndup (checksum, 12);
++          ref = short_checksum;
++        }
++      g_print ("%.1f MB  %s\n", freed / (1024.0 * 1024.0), ref);
++      (*objects)++;
++      *freed_bytes += freed;
++    }
++
++  return TRUE;
++}
++
++static gboolean
++clean_extra_data_dir (GFile        *dir,
++                      GCancellable *cancellable,
++                      guint        *objects,
++                      guint64      *freed_bytes,
++                      GError      **error)
++{
++  g_autoptr(GFileEnumerator) enumerator = NULL;
++  g_autoptr(GError) local_error = NULL;
++
++  enumerator = g_file_enumerate_children (dir,
++                                          G_FILE_ATTRIBUTE_STANDARD_NAME ","
++                                          G_FILE_ATTRIBUTE_STANDARD_TYPE ","
++                                          G_FILE_ATTRIBUTE_STANDARD_SIZE,
++                                          G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
++                                          cancellable, &local_error);
++  if (enumerator == NULL)
++    {
++      if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++        return TRUE;
++      g_propagate_error (error, g_steal_pointer (&local_error));
++      return FALSE;
++    }
++
++  while (TRUE)
++    {
++      GFileInfo *info;
++      GFile *child;
++      const char *name;
++      GFileType type;
++
++      if (!g_file_enumerator_iterate (enumerator, &info, &child,
++                                      cancellable, error))
++        return FALSE;
++      if (info == NULL)
++        break;
++
++      name = g_file_info_get_name (info);
++      type = g_file_info_get_file_type (info);
++      if (type == G_FILE_TYPE_DIRECTORY)
++        {
++          if (!clean_extra_data_dir (child, cancellable, objects, freed_bytes, error))
++            return FALSE;
++          if (!opt_dry_run && !g_file_delete (child, cancellable, &local_error) &&
++              !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY) &&
++              !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++            {
++              g_propagate_error (error, g_steal_pointer (&local_error));
++              return FALSE;
++            }
++          g_clear_error (&local_error);
++        }
++      else if (type == G_FILE_TYPE_REGULAR && g_str_has_suffix (name, ".part"))
++        {
++          g_autofree char *path = g_file_get_path (child);
++          guint64 size = g_file_info_get_size (info);
++
++          g_print ("%.1f MB  %s\n", size / (1024.0 * 1024.0), path);
++          if (!opt_dry_run && !g_file_delete (child, cancellable, error))
++            return FALSE;
++          (*objects)++;
++          *freed_bytes += size;
++        }
++      else
++        {
++          g_autofree char *path = g_file_get_path (child);
++          g_print (_("Keeping: %s\n"), path);
++        }
++    }
++
++  return TRUE;
++}
++
++gboolean
++flatpak_builtin_clean (int argc, char **argv, GCancellable *cancellable, GError **error)
++{
++  g_autoptr(GOptionContext) context = NULL;
++  g_autoptr(GPtrArray) dirs = NULL;
++  g_autoptr(GCancellable) lock_cancellable = NULL;
++  g_autoptr(GError) lock_error = NULL;
++  g_autoptr(OstreeRepoAutoLock) repo_lock = NULL;
++  g_autoptr(GFile) extra_data_dir = NULL;
++  g_autofree char *repo_path = NULL;
++  FlatpakDir *dir;
++  OstreeRepo *repo;
++  guint objects = 0;
++  guint64 freed_bytes = 0;
++  GThread *lock_timeout_thread;
++
++  context = g_option_context_new (_("- Remove cached extra-data from the local repository"));
++  g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);
++
++  if (!flatpak_option_context_parse (context, options, &argc, &argv,
++                                     FLATPAK_BUILTIN_FLAG_ONE_DIR,
++                                     &dirs, cancellable, error))
++    return FALSE;
++  if (argc != 1)
++    return usage_error (context, _("Too many arguments"), error);
++
++  dir = g_ptr_array_index (dirs, 0);
++  flatpak_dir_set_no_system_helper (dir, TRUE);
++  if (!flatpak_dir_ensure_repo (dir, cancellable, error))
++    return FALSE;
++
++  repo = flatpak_dir_get_repo (dir);
++  repo_path = g_file_get_path (ostree_repo_get_path (repo));
++  if (access (repo_path, W_OK) != 0)
++    return flatpak_fail (error,
++                         _("The repository at %s is not writable; run this command as root"),
++                         repo_path);
++
++  lock_cancellable = g_cancellable_new ();
++  lock_timeout_thread = g_thread_new ("clean-lock-timeout", cancel_lock_wait,
++                                      lock_cancellable);
++  repo_lock = ostree_repo_auto_lock_push (repo, OSTREE_REPO_LOCK_EXCLUSIVE,
++                                          lock_cancellable, &lock_error);
++  g_thread_join (lock_timeout_thread);
++  if (repo_lock == NULL)
++    {
++      if (g_cancellable_set_error_if_cancelled (cancellable, error))
++        return FALSE;
++      if (g_error_matches (lock_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++        return flatpak_fail (error, _("The repository is busy with another transaction"));
++      g_propagate_error (error, g_steal_pointer (&lock_error));
++      g_prefix_error (error, _("Unable to acquire exclusive repository lock: "));
++      return FALSE;
++    }
++
++  if (!clean_commit_metadata (repo, cancellable, &objects, &freed_bytes, error))
++    return FALSE;
++
++  extra_data_dir = flatpak_build_file (flatpak_get_user_base_dir_location (),
++                                       "extra-data", NULL);
++  if (!clean_extra_data_dir (extra_data_dir, cancellable,
++                             &objects, &freed_bytes, error))
++    return FALSE;
++  if (!opt_dry_run)
++    {
++      g_autoptr(GError) local_error = NULL;
++
++      if (!g_file_delete (extra_data_dir, cancellable, &local_error) &&
++          !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY) &&
++          !g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++        {
++          g_propagate_error (error, g_steal_pointer (&local_error));
++          return FALSE;
++        }
++    }
++
++  if (opt_dry_run)
++    g_print (_("Would free: %u objects, %.2f GB\n"),
++             objects, freed_bytes / (1024.0 * 1024.0 * 1024.0));
++  else
++    g_print (_("Freed: %u objects, %.2f GB\n"),
++             objects, freed_bytes / (1024.0 * 1024.0 * 1024.0));
++
++  return TRUE;
++}
++
++gboolean
++flatpak_complete_clean (FlatpakCompletion *completion)
++{
++  g_autoptr(GOptionContext) context = NULL;
++
++  context = g_option_context_new ("");
++  if (!flatpak_option_context_parse (context, options,
++                                     &completion->argc, &completion->argv,
++                                     FLATPAK_BUILTIN_FLAG_ONE_DIR,
++                                     NULL, NULL, NULL))
++    return FALSE;
++
++  flatpak_complete_options (completion, global_entries);
++  flatpak_complete_options (completion, options);
++  flatpak_complete_options (completion, user_entries);
++  return TRUE;
++}
+diff --git a/app/flatpak-builtins.h b/app/flatpak-builtins.h
+index 20eb2272..19097c78 100644
+--- a/app/flatpak-builtins.h
++++ b/app/flatpak-builtins.h
+@@ -123,6 +123,7 @@ BUILTINPROTO (override)
+ BUILTINPROTO (repo)
+ BUILTINPROTO (config)
+ BUILTINPROTO (search)
++BUILTINPROTO (clean)
+ BUILTINPROTO (repair)
+ BUILTINPROTO (create_usb)
+ BUILTINPROTO (kill)
+diff --git a/app/flatpak-main.c b/app/flatpak-main.c
+index d3fbe3bd..b2a5433c 100644
+--- a/app/flatpak-main.c
++++ b/app/flatpak-main.c
+@@ -87,6 +87,7 @@ static FlatpakCommand commands[] = {
+   { "info", N_("Show info for installed app or runtime"), flatpak_builtin_info, flatpak_complete_info },
+   { "history", N_("Show history"), flatpak_builtin_history, flatpak_complete_history },
+   { "config", N_("Configure flatpak"), flatpak_builtin_config, flatpak_complete_config },
++  { "clean", N_("Remove cached extra-data from the local repository"), flatpak_builtin_clean, flatpak_complete_clean },
+   { "repair", N_("Repair flatpak installation"), flatpak_builtin_repair, flatpak_complete_repair },
+   { "create-usb", N_("Put applications or runtimes onto removable media"), flatpak_builtin_create_usb, flatpak_complete_create_usb },
+   { "preinstall", N_("Install flatpaks that are part of the operating system"), flatpak_builtin_preinstall, flatpak_complete_preinstall },
+diff --git a/app/meson.build b/app/meson.build
+index 8e6ef1dd..dd335b32 100644
+--- a/app/meson.build
++++ b/app/meson.build
+@@ -79,6 +79,7 @@ sources = [
+   'flatpak-builtins-build-sign.c',
+   'flatpak-builtins-build-update-repo.c',
+   'flatpak-builtins-build.c',
++  'flatpak-builtins-clean.c',
+   'flatpak-builtins-config.c',
+   'flatpak-builtins-create-usb.c',
+   'flatpak-builtins-document-export.c',
+diff --git a/common/flatpak-dir.c b/common/flatpak-dir.c
+index 6ad7191f..6490080f 100644
+--- a/common/flatpak-dir.c
++++ b/common/flatpak-dir.c
+@@ -10531,7 +10531,7 @@ flatpak_dir_deploy (FlatpakDir          *self,
+       {
+         g_autoptr(GError) local_error = NULL;
+ 
+-        if (!flatpak_repo_remove_extra_data (self->repo, checksum, NULL, NULL,
++        if (!flatpak_repo_remove_extra_data (self->repo, checksum, FALSE, NULL, NULL,
+                                              cancellable, &local_error))
+           g_warning ("Unable to remove extra data from commit %s: %s",
+                      checksum, local_error->message);
+diff --git a/common/flatpak-extra-data-private.c b/common/flatpak-extra-data-private.c
+index 580d52d2..88182b30 100644
+--- a/common/flatpak-extra-data-private.c
++++ b/common/flatpak-extra-data-private.c
+@@ -27,6 +27,7 @@ get_commitmeta_size (OstreeRepo *repo,
+ gboolean
+ flatpak_repo_remove_extra_data (OstreeRepo   *repo,
+                                 const char   *checksum,
++                                gboolean      dry_run,
+                                 gboolean     *out_removed,
+                                 guint64      *out_freed_bytes,
+                                 GCancellable *cancellable,
+@@ -59,11 +60,13 @@ flatpak_repo_remove_extra_data (OstreeRepo   *repo,
+   g_variant_dict_remove (&metadata_dict, "xa.extra-data");
+   new_metadata = g_variant_ref_sink (g_variant_dict_end (&metadata_dict));
+ 
+-  if (!ostree_repo_write_commit_detached_metadata (repo, checksum, new_metadata,
++  if (!dry_run &&
++      !ostree_repo_write_commit_detached_metadata (repo, checksum, new_metadata,
+                                                    cancellable, error))
+     return FALSE;
+ 
+-  new_size = get_commitmeta_size (repo, checksum);
++  new_size = dry_run ? g_variant_get_size (new_metadata) :
++             get_commitmeta_size (repo, checksum);
+   if (out_removed != NULL)
+     *out_removed = TRUE;
+   if (out_freed_bytes != NULL && old_size > new_size)
+diff --git a/common/flatpak-extra-data-private.h b/common/flatpak-extra-data-private.h
+index 24c15518..6efc86d1 100644
+--- a/common/flatpak-extra-data-private.h
++++ b/common/flatpak-extra-data-private.h
+@@ -10,6 +10,7 @@
+ 
+ gboolean flatpak_repo_remove_extra_data (OstreeRepo   *repo,
+                                          const char   *checksum,
++                                         gboolean      dry_run,
+                                          gboolean     *out_removed,
+                                          guint64      *out_freed_bytes,
+                                          GCancellable *cancellable,
+diff --git a/doc/flatpak-clean.xml b/doc/flatpak-clean.xml
+new file mode 100644
+index 00000000..375788aa
+--- /dev/null
++++ b/doc/flatpak-clean.xml
+@@ -0,0 +1,96 @@
++<?xml version='1.0'?> <!--*-nxml-*-->
++<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
++    "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
++
++<refentry id="flatpak-clean">
++    <refentryinfo>
++        <title>flatpak clean</title>
++        <productname>flatpak</productname>
++    </refentryinfo>
++
++    <refmeta>
++        <refentrytitle>flatpak clean</refentrytitle>
++        <manvolnum>1</manvolnum>
++    </refmeta>
++
++    <refnamediv>
++        <refname>flatpak-clean</refname>
++        <refpurpose>Remove cached extra-data from the local repository</refpurpose>
++    </refnamediv>
++
++    <refsynopsisdiv>
++        <cmdsynopsis>
++            <command>flatpak clean</command>
++            <arg choice="opt" rep="repeat">OPTION</arg>
++        </cmdsynopsis>
++    </refsynopsisdiv>
++
++    <refsect1>
++        <title>Description</title>
++        <para>
++            Removes embedded extra-data from commits in a local Flatpak repository.
++            It also removes incomplete <filename>.part</filename> downloads from the
++            per-user extra-data directory. Other files in that directory are reported
++            and left unchanged.
++        </para>
++        <para>
++            The repository is locked exclusively while it is inspected and modified.
++            Cleaning a system installation requires direct write access to its repository
++            and does not use the Flatpak system helper.
++        </para>
++    </refsect1>
++
++    <refsect1>
++        <title>Options</title>
++        <variablelist>
++            <varlistentry>
++                <term><option>-h</option></term>
++                <term><option>--help</option></term>
++                <listitem><para>Show help options and exit.</para></listitem>
++            </varlistentry>
++            <varlistentry>
++                <term><option>-u</option></term>
++                <term><option>--user</option></term>
++                <listitem><para>Clean the per-user installation.</para></listitem>
++            </varlistentry>
++            <varlistentry>
++                <term><option>--system</option></term>
++                <listitem><para>Clean the default system-wide installation.</para></listitem>
++            </varlistentry>
++            <varlistentry>
++                <term><option>--installation=NAME</option></term>
++                <listitem><para>
++                    Clean the system-wide installation specified by
++                    <arg choice="plain">NAME</arg>.
++                </para></listitem>
++            </varlistentry>
++            <varlistentry>
++                <term><option>--dry-run</option></term>
++                <listitem><para>Report what would be removed without making changes.</para></listitem>
++            </varlistentry>
++            <varlistentry>
++                <term><option>-v</option></term>
++                <term><option>--verbose</option></term>
++                <listitem><para>Print debug information during command processing.</para></listitem>
++            </varlistentry>
++            <varlistentry>
++                <term><option>--ostree-verbose</option></term>
++                <listitem><para>Print OSTree debug information during command processing.</para></listitem>
++            </varlistentry>
++        </variablelist>
++    </refsect1>
++
++    <refsect1>
++        <title>Examples</title>
++        <para><command>$ flatpak clean --user --dry-run</command></para>
++        <para><command>$ sudo flatpak clean --system</command></para>
++    </refsect1>
++
++    <refsect1>
++        <title>See also</title>
++        <para>
++            <citerefentry><refentrytitle>flatpak</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
++            <citerefentry><refentrytitle>flatpak-repair</refentrytitle><manvolnum>1</manvolnum></citerefentry>
++        </para>
++    </refsect1>
++</refentry>
+diff --git a/doc/flatpak.xml b/doc/flatpak.xml
+index 4aded324..a778053d 100644
+--- a/doc/flatpak.xml
++++ b/doc/flatpak.xml
+@@ -277,6 +277,13 @@
+                     Manage flatpak configuration.
+                 </para></listitem>
+             </varlistentry>
++            <varlistentry>
++                <term><citerefentry><refentrytitle>flatpak-clean</refentrytitle><manvolnum>1</manvolnum></citerefentry></term>
++
++                <listitem><para>
++                    Remove cached extra-data from the local repository.
++                </para></listitem>
++            </varlistentry>
+             <varlistentry>
+                 <term><citerefentry><refentrytitle>flatpak-repair</refentrytitle><manvolnum>1</manvolnum></citerefentry></term>
+ 
+diff --git a/doc/meson.build b/doc/meson.build
+index 9ef8eee1..43e4ab1f 100644
+--- a/doc/meson.build
++++ b/doc/meson.build
+@@ -24,6 +24,7 @@ man1 = [
+   'flatpak-remote-info',
+   'flatpak-install',
+   'flatpak-config',
++  'flatpak-clean',
+   'flatpak-update',
+   'flatpak-uninstall',
+   'flatpak-preinstall',
+diff --git a/tests/test-extra-data.sh b/tests/test-extra-data.sh
+index 591eb730..94a890a6 100755
+--- a/tests/test-extra-data.sh
++++ b/tests/test-extra-data.sh
+@@ -73,10 +73,57 @@ ${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
+ ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
+ assert_file_has_content detached-keys "^xa.extra-data$"
+ assert_file_has_content detached-keys "^ostree.gpgsigs$"
+-${FLATPAK} ${U} uninstall -y org.test.Hello >&2
+-${FLATPAK} ${U} config --unset keep-extra-data
+ ok "keep extra data in detached metadata when configured"
+ 
++mkdir -p "${USERDIR}/extra-data/cleanup"
++printf partial > "${USERDIR}/extra-data/cleanup/orphan.part"
++printf keep > "${USERDIR}/extra-data/cleanup/keep.txt"
++${FLATPAK} ${U} clean --dry-run > clean-dry-run-out
++assert_file_has_content clean-dry-run-out "Would free:"
++ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
++assert_file_has_content detached-keys "^xa.extra-data$"
++assert_has_file "${USERDIR}/extra-data/cleanup/orphan.part"
++
++${FLATPAK} ${U} clean > clean-out
++assert_file_has_content clean-out "Freed:"
++ostree --repo="${FL_DIR}/repo" show --list-detached-metadata-keys "${EXTRA_DATA_COMMIT}" > detached-keys
++assert_not_file_has_content detached-keys "^xa.extra-data$"
++assert_file_has_content detached-keys "^ostree.gpgsigs$"
++assert_not_has_file "${USERDIR}/extra-data/cleanup/orphan.part"
++assert_has_file "${USERDIR}/extra-data/cleanup/keep.txt"
++${FLATPAK} run --command=sh org.test.Hello -c "cat /app/extra/test" > out
++assert_file_has_content out "extra-data-test-content"
++${FLATPAK} ${U} config --unset keep-extra-data
++${FLATPAK} ${U} repair >&2
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
++: > "${EVENTS_LOG}"
++${FLATPAK} ${U} install -y ${REPONAME}-repo org.test.Hello ${BRANCH} >&2
++assert_file_has_content "${EVENTS_LOG}" "/${EXTRA_DATA_FILE}"
++${FLATPAK} ${U} uninstall -y org.test.Hello >&2
++rm -rf "${USERDIR}/extra-data/cleanup"
++ok "clean cached extra data"
++
++LOCK_READY="${TEST_DATA_DIR}/clean-lock-ready"
++python3 - "${FL_DIR}/repo/.lock" "${LOCK_READY}" <<'PY' &
++import fcntl
++import sys
++import time
++
++with open(sys.argv[1], 'w') as lock_file:
++    fcntl.lockf(lock_file, fcntl.LOCK_EX)
++    open(sys.argv[2], 'w').close()
++    time.sleep(3)
++PY
++LOCK_PID=$!
++while ! test -e "${LOCK_READY}"; do sleep 0.05; done
++if ${FLATPAK} ${U} clean > clean-locked-out 2>&1; then
++    assert_not_reached
++fi
++assert_file_has_content clean-locked-out "repository is busy with another transaction"
++wait "${LOCK_PID}"
++rm "${LOCK_READY}"
++ok "reject clean while repository is locked"
++
+ # A file supplied by the user must never be removed by the prefetcher.
+ mkdir -p "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}"
+ cp "${DOWNLOADED_EXTRA_DATA}" "${USERDIR}/extra-data/${EXTRA_DATA_SHA256}/${EXTRA_DATA_FILE}"
